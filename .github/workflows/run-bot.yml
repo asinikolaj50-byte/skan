@@ -1,17 +1,24 @@
 name: Run OSINT Telegram Bot
 
 on:
-  workflow_dispatch:  # запускаешь вручную кнопкой на GitHub
+  workflow_dispatch:  # запускать вручную
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install -r requirements.txt
-      - run: python bot.py
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run bot
         env:
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}  # берёт из Secrets
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+        run: python bot.py
