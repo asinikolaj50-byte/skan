@@ -89,16 +89,14 @@ def rand_str(n: int) -> str:
     return "".join(random.choices(string.ascii_lowercase + string.digits, k=n))
 
 
-def esc(text: str) -> str:
-    """Экранирует спецсимволы для Telegram MarkdownV2."""
-    for ch in r"\_*[]()~`>#+-=|{}.!":
-        text = text.replace(ch, f"\\{ch}")
-    return text
+def h(text: str) -> str:
+    """Экранирует спецсимволы HTML для Telegram."""
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def make_link(text: str, url: str) -> str:
-    """Ссылка в формате MarkdownV2: [текст](url)."""
-    return f"[{esc(text)}]({url})"
+    """Ссылка в формате HTML."""
+    return f'<a href="{h(url)}">{h(text)}</a>'
 
 
 def profile_url(platform: str, username: str) -> str:
@@ -740,57 +738,57 @@ async def scan_username(username: str) -> tuple[dict, float]:
     }, elapsed
 
 
-# ─── ФОРМАТТЕРЫ (MarkdownV2) ──────────────────────────────────────────────────
+# ─── ФОРМАТТЕРЫ (HTML) ────────────────────────────────────────────────────────
 
 def _email_line(platform: str, res: dict) -> str:
     icon = ICONS.get(platform, "🔎")
-    name = esc(platform)
+    name = h(platform)
     if res.get("found") is True:
-        return f"{icon} *{name}:* ✅ Зарегистрирован"
+        return f"{icon} <b>{name}:</b> ✅ Зарегистрирован"
     if res.get("found") == "rate_limit":
-        return f"{icon} *{name}:* ⏳ Rate limit — повтори позже"
+        return f"{icon} <b>{name}:</b> ⏳ Rate limit — повтори позже"
     if res.get("found") is False:
-        return f"{icon} *{name}:* ❌ Не зарегистрирован"
+        return f"{icon} <b>{name}:</b> ❌ Не зарегистрирован"
     if res.get("error"):
-        return f"{icon} *{name}:* 🔴 `{esc(res['error'])}`"
-    return f"{icon} *{name}:* ❓"
+        return f"{icon} <b>{name}:</b> 🔴 <code>{h(res['error'])}</code>"
+    return f"{icon} <b>{name}:</b> ❓"
 
 
 def fmt_email(email: str, results: dict, elapsed: float) -> str:
-    lines = [f"📧 *Email:* `{esc(email)}`\n"]
+    lines = [f"📧 <b>Email:</b> <code>{h(email)}</code>\n"]
     for p in ["Twitter/X", "Facebook", "Instagram", "LinkedIn", "Discord", "CryptoRank"]:
         lines.append(_email_line(p, results.get(p, {})))
-    lines.append(f"\n⏱ Проверено за *{elapsed:.1f}с*")
+    lines.append(f"\n⏱ Проверено за <b>{elapsed:.1f}с</b>")
     return "\n".join(lines)
 
 
 def _user_line(platform: str, res: dict, username: str) -> str:
     icon = ICONS.get(platform, "🔎")
-    name = esc(platform)
+    name = h(platform)
     url = res.get("url") or profile_url(platform, username)
     link = make_link("профиль", url) if url else ""
 
     if res.get("found") == "manual":
-        return f"{icon} *{name}:* 🔗 {make_link('проверь вручную', url)}"
+        return f"{icon} <b>{name}:</b> 🔗 {make_link('проверь вручную', url)}"
     if res.get("found") is True:
-        return f"{icon} *{name}:* ✅ Найден — {link}"
+        return f"{icon} <b>{name}:</b> ✅ Найден — {link}"
     if res.get("found") == "maybe":
-        note = esc(res.get("note", ""))
-        return f"{icon} *{name}:* ⚠️ Вероятно — {link}\n   __{note}__"
+        note = h(res.get("note", ""))
+        return f"{icon} <b>{name}:</b> ⚠️ Вероятно — {link}\n   <i>{note}</i>"
     if res.get("found") == "rate_limit":
-        return f"{icon} *{name}:* ⏳ Rate limit — {link}"
+        return f"{icon} <b>{name}:</b> ⏳ Rate limit — {link}"
     if res.get("found") is False:
-        return f"{icon} *{name}:* ❌ Не найден"
+        return f"{icon} <b>{name}:</b> ❌ Не найден"
     if res.get("error"):
-        return f"{icon} *{name}:* 🔴 `{esc(res['error'])}`"
-    return f"{icon} *{name}:* ❓"
+        return f"{icon} <b>{name}:</b> 🔴 <code>{h(res['error'])}</code>"
+    return f"{icon} <b>{name}:</b> ❓"
 
 
 def fmt_username(username: str, results: dict, elapsed: float) -> str:
-    lines = [f"👤 *Username:* `{esc(username)}`\n"]
+    lines = [f"👤 <b>Username:</b> <code>{h(username)}</code>\n"]
     for p in ["Twitter/X", "LinkedIn", "Facebook", "CryptoRank", "OpenSea"]:
         lines.append(_user_line(p, results.get(p, {}), username))
-    lines.append(f"\n⏱ Проверено за *{elapsed:.1f}с*")
+    lines.append(f"\n⏱ Проверено за <b>{elapsed:.1f}с</b>")
     return "\n".join(lines)
 
 
@@ -798,10 +796,10 @@ def fmt_username(username: str, results: dict, elapsed: float) -> str:
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "👋 *OSINT\\-бот* — поиск аккаунтов по email и username\n\n"
+        "👋 <b>OSINT-бот</b> — поиск аккаунтов по email и username\n\n"
         "Платформы: Twitter/X, Facebook, Instagram, LinkedIn, Discord, CryptoRank, OpenSea",
         reply_markup=kb_main(),
-        parse_mode=ParseMode.MARKDOWN_V2,
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -813,40 +811,40 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if data == "back:main":
         context.user_data.clear()
         await q.edit_message_text(
-            "👋 *OSINT\\-бот* — выбери режим:",
+            "👋 <b>OSINT-бот</b> — выбери режим:",
             reply_markup=kb_main(),
-            parse_mode=ParseMode.MARKDOWN_V2,
+            parse_mode=ParseMode.HTML,
         )
 
     elif data == "help":
         text = (
-            "*Методы проверки:*\n\n"
-            "🐦 *Twitter/X* — `email_available` API \\(точный\\.\\)\n"
-            "📘 *Facebook* — forgot\\-password flow \\(точный\\.\\)\n"
-            "📸 *Instagram* — registration API \\(точный\\.\\)\n"
-            "💼 *LinkedIn* — forgot\\-password \\+ login flow \\(точный\\.\\)\n"
-            "🎮 *Discord* — registration API v10 \\(точный\\.\\)\n"
-            "📊 *CryptoRank* — reset\\-password API \\(точный\\.\\)\n"
-            "🌊 *OpenSea* — страница профиля по username\n\n"
-            "При email\\-проверке возвращается только ✅/❌ \\— никакого \"возможно\"\n"
-            "При username\\-проверке выводится прямая ссылка на профиль"
+            "<b>Методы проверки:</b>\n\n"
+            "🐦 <b>Twitter/X</b> — email_available API (точный)\n"
+            "📘 <b>Facebook</b> — forgot-password flow (точный)\n"
+            "📸 <b>Instagram</b> — registration API (точный)\n"
+            "💼 <b>LinkedIn</b> — forgot-password + login flow (точный)\n"
+            "🎮 <b>Discord</b> — registration API v10 (точный)\n"
+            "📊 <b>CryptoRank</b> — reset-password API (точный)\n"
+            "🌊 <b>OpenSea</b> — страница профиля по username\n\n"
+            "При email-проверке: только ✅ / ❌ — никакого «возможно»\n"
+            "При username-проверке: кликабельная ссылка на профиль"
         )
-        await q.edit_message_text(text, reply_markup=kb_back(), parse_mode=ParseMode.MARKDOWN_V2)
+        await q.edit_message_text(text, reply_markup=kb_back(), parse_mode=ParseMode.HTML)
 
     elif data.startswith("mode:"):
         mode = data.split(":")[1]
         context.user_data["mode"] = mode
         context.user_data.pop("both_step", None)
         prompts = {
-            "email": "Введи *email* для проверки:",
-            "user":  "Введи *username* для поиска:",
-            "both":  "Введи *email* для проверки \\(потом попрошу username\\):",
-            "file":  "Отправь `.txt` файл \\(каждый email или username на новой строке\\):",
+            "email": "Введи <b>email</b> для проверки:",
+            "user":  "Введи <b>username</b> для поиска:",
+            "both":  "Введи <b>email</b> для проверки (потом попрошу username):",
+            "file":  "Отправь <code>.txt</code> файл (каждый email или username на новой строке):",
         }
         await q.edit_message_text(
             prompts[mode],
             reply_markup=kb_cancel(),
-            parse_mode=ParseMode.MARKDOWN_V2,
+            parse_mode=ParseMode.HTML,
         )
 
 
@@ -860,26 +858,25 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if mode == "email":
         if not is_email(text):
-            await update.message.reply_text("❌ Неверный формат email\\. Попробуй ещё раз\\.",
-                                            parse_mode=ParseMode.MARKDOWN_V2)
+            await update.message.reply_text("❌ Неверный формат email. Попробуй ещё раз.")
             return
-        msg = await update.message.reply_text("⏳ Проверяю email\\.\\.\\.", parse_mode=ParseMode.MARKDOWN_V2)
+        msg = await update.message.reply_text("⏳ Проверяю email...")
         results, elapsed = await scan_email(text)
         await msg.edit_text(
             fmt_email(text, results, elapsed),
-            parse_mode=ParseMode.MARKDOWN_V2,
+            parse_mode=ParseMode.HTML,
             reply_markup=kb_back(),
         )
 
     elif mode == "user":
         if not text:
-            await update.message.reply_text("❌ Введи username\\.", parse_mode=ParseMode.MARKDOWN_V2)
+            await update.message.reply_text("❌ Введи username.")
             return
-        msg = await update.message.reply_text("⏳ Ищу профили\\.\\.\\.", parse_mode=ParseMode.MARKDOWN_V2)
+        msg = await update.message.reply_text("⏳ Ищу профили...")
         results, elapsed = await scan_username(text)
         await msg.edit_text(
             fmt_username(text, results, elapsed),
-            parse_mode=ParseMode.MARKDOWN_V2,
+            parse_mode=ParseMode.HTML,
             reply_markup=kb_back(),
         )
 
@@ -887,23 +884,23 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         step = context.user_data.get("both_step", "email")
         if step == "email":
             if not is_email(text):
-                await update.message.reply_text("❌ Неверный формат email\\.", parse_mode=ParseMode.MARKDOWN_V2)
+                await update.message.reply_text("❌ Неверный формат email.")
                 return
             context.user_data["both_step"] = "user"
-            msg = await update.message.reply_text("⏳ Проверяю email\\.\\.\\.", parse_mode=ParseMode.MARKDOWN_V2)
+            msg = await update.message.reply_text("⏳ Проверяю email...")
             results, elapsed = await scan_email(text)
-            await msg.edit_text(fmt_email(text, results, elapsed), parse_mode=ParseMode.MARKDOWN_V2)
+            await msg.edit_text(fmt_email(text, results, elapsed), parse_mode=ParseMode.HTML)
             await update.message.reply_text(
-                "Теперь введи *username* для проверки профилей:",
-                parse_mode=ParseMode.MARKDOWN_V2,
+                "Теперь введи <b>username</b> для проверки профилей:",
+                parse_mode=ParseMode.HTML,
                 reply_markup=kb_cancel(),
             )
         else:
-            msg = await update.message.reply_text("⏳ Ищу профили\\.\\.\\.", parse_mode=ParseMode.MARKDOWN_V2)
+            msg = await update.message.reply_text("⏳ Ищу профили...")
             results, elapsed = await scan_username(text)
             await msg.edit_text(
                 fmt_username(text, results, elapsed),
-                parse_mode=ParseMode.MARKDOWN_V2,
+                parse_mode=ParseMode.HTML,
                 reply_markup=kb_back(),
             )
             context.user_data.clear()
@@ -920,7 +917,7 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     doc = update.message.document
     if not (doc.file_name or "").endswith(".txt"):
-        await update.message.reply_text("❌ Поддерживаются только \.txt файлы.", parse_mode=ParseMode.MARKDOWN_V2)
+        await update.message.reply_text("❌ Поддерживаются только .txt файлы.")
         return
 
     file = await doc.get_file()
@@ -943,11 +940,11 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         else:
             res, elapsed = await scan_username(line)
             out = fmt_username(line, res, elapsed)
-        await update.message.reply_text(out, parse_mode=ParseMode.MARKDOWN_V2)
+        await update.message.reply_text(out, parse_mode=ParseMode.HTML)
         await asyncio.sleep(1.5)
 
     context.user_data.clear()
-    await update.message.reply_text("✅ Готово\\!", parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb_main())
+    await update.message.reply_text("✅ Готово!", reply_markup=kb_main())
 
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
