@@ -1,0 +1,44 @@
+from urllib.parse import quote
+
+from user_scanner.core.helpers import get_random_user_agent
+from user_scanner.core.orchestrator import generic_validate
+from user_scanner.core.result import Result
+
+
+def validate_monkeytype(user: str) -> Result:
+    safe_user = quote(user, safe="")
+    url = f"https://api.monkeytype.com/users/checkName/{safe_user}"
+    show_url = f"https://monkeytype.com/profile/{safe_user}"
+
+    headers = {
+        "User-Agent": get_random_user_agent(),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Encoding": "identity",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    def process(response):
+        if response.status_code == 200:
+            data = response.json()
+            # Expected shape:
+            # { "message": "string", "data": { "available": true/false } }
+            payload = data.get("data", {})
+            available = payload.get("available")
+
+            if available is True:
+                return Result.available()
+            elif available is False:
+                return Result.taken()
+
+        # Surface Monkeytype validation errors (e.g. special characters)
+        try:
+            data = response.json()
+            errors = data.get("validationErrors")
+            if errors:
+                return Result.error("; ".join(errors))
+        except Exception:
+            pass
+
+        return Result.error("Invalid status code")
+
+    return generic_validate(url, process, show_url=show_url, headers=headers)
