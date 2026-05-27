@@ -24,6 +24,15 @@ EMAIL_RE = re.compile(r'^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$')
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# Прямые ссылки на профиль — всегда показываем пользователю
+PROFILE_URLS = {
+    "Twitter/X":  "https://x.com/{u}",
+    "LinkedIn":   "https://www.linkedin.com/in/{u}",
+    "Facebook":   "https://www.facebook.com/{u}",
+    "CryptoRank": "https://cryptorank.io/profile/{u}",
+    "OpenSea":    "https://opensea.io/{u}",
+}
+
 BROWSER_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -109,22 +118,9 @@ async def check_linkedin(username: str, client: httpx.AsyncClient) -> dict:
 
 
 async def check_facebook(username: str, client: httpx.AsyncClient) -> dict:
-    """Проверяет Facebook профиль."""
+    """Facebook блокирует ботов — даём ссылку для ручной проверки."""
     url = f"https://www.facebook.com/{username}"
-    try:
-        r = await client.get(url)
-        final_url = str(r.url)
-        if r.status_code == 200:
-            if "login" in final_url or "checkpoint" in final_url:
-                return {"found": "maybe", "url": url, "note": "FB требует логин — проверь вручную"}
-            if "page not found" in r.text.lower() or "этот контент" in r.text.lower():
-                return {"found": False}
-            return {"found": True, "url": url}
-        if r.status_code == 404:
-            return {"found": False}
-        return {"error": f"HTTP {r.status_code}"}
-    except Exception as e:
-        return {"error": str(e)[:80]}
+    return {"found": "manual", "url": url}
 
 
 async def check_cryptorank(username: str, client: httpx.AsyncClient) -> dict:
@@ -214,10 +210,6 @@ def _email_scan_sync(email: str) -> tuple[dict, float]:
     start = time.time()
     results = trio.run(_run)
     elapsed = time.time() - start
-
-    # Добавляем CryptoRank и OpenSea — они не поддерживают email-проверку
-    results["CryptoRank"] = {"note": "Нет email-проверки (Web3 платформа)"}
-    results["OpenSea"]    = {"note": "Нет email-проверки (Web3 платформа)"}
     return results, elapsed
 
 
@@ -302,52 +294,53 @@ def fmt_username(username: str, results: dict, elapsed: float) -> str:
     }
     for platform, res in results.items():
         icon = icons.get(platform, "🔎")
-        if res.get("found") is True:
-            url = res.get("url", "")
-            lines.append(f"{icon} *{platform}:* ✅ Найден — [открыть профиль]({url})")
+        # Всегда строим прямую ссылку на профиль
+        profile_url = PROFILE_URLS.get(platform, "").format(u=username)
+        link = f"[→ профиль]({profile_url})" if profile_url else ""
+
+        if res.get("found") == "manual":
+            # Facebook: авто-проверка невозможна, даём ссылку
+            lines.append(f"{icon} *{platform}:* 🔗 Проверь вручную — {link}")
+        elif res.get("found") is True:
+            lines.append(f"{icon} *{platform}:* ✅ Найден — {link}")
         elif res.get("found") == "maybe":
-            url = res.get("url", "")
             note = res.get("note", "")
-            link = f" — [ссылка]({url})" if url else ""
-            lines.append(f"{icon} *{platform}:* ⚠️ Возможно{link}\n     _{note}_")
+            lines.append(f"{icon} *{platform}:* ⚠️ Возможно — {link}\n     _{note}_")
         elif res.get("found") is False:
-            lines.append(f"{icon} *{platform}:* ❌ Не найден")
+            lines.append(f"{icon} *{platform}:* ❌ Не найден — {link}")
         elif res.get("error"):
-            lines.append(f"{icon} *{platform}:* 🔴 Ошибка: `{res['error']}`")
+            lines.append(f"{icon} *{platform}:* 🔴 Ошибка — {link}\n     `{res['error']}`")
         else:
-            lines.append(f"{icon} *{platform}:* ❓ Нет данных")
+            lines.append(f"{icon} *{platform}:* ❓ — {link}")
     lines.append(f"\n📊 Проверено за *{elapsed:.1f}с*")
     return "\n".join(lines)
 
 
 def fmt_email(email: str, results: dict, elapsed: float) -> str:
     lines = [f"📧 *Email:* `{email}`\n"]
-    icons = {
-        "Twitter/X":   "🐦",
-        "LinkedIn":    "💼",
-        "Facebook":    "📘",
-        "CryptoRank":  "📊",
-        "OpenSea":     "🌊",
-    }
-    for platform, res in results.items():
-        icon = icons.get(platform, "🔎")
-        if res.get("note") and res.get("found") is None:
-            lines.append(f"{icon} *{platform}:* ℹ️ _{res['note']}_")
-        elif res.get("found") is True:
-            extra = f" ({res['extra']})" if res.get("extra") else ""
+    icons = {"Twitter/X": "🐦", "LinkedIn": "💼", "Facebook": "📘"}
+    # CryptoRank и OpenSea не проверяют email — не показываем их
+    for platform in ["Twitter/X", "LinkedIn", "Facebook"]:
+        res = results.get(platform, {})
+        icon = icons[platform]
+        if res.get("found") is True:
+            extra = f" _{res['extra']}_" if res.get("extra") else ""
             lines.append(f"{icon} *{platform}:* ✅ Зарегистрирован{extra}")
         elif res.get("found") == "rate_limit":
             lines.append(f"{icon} *{platform}:* ⚠️ Rate limit — попробуй позже")
         elif res.get("found") == "maybe":
             note = res.get("note", "")
-            lines.append(f"{icon} *{platform}:* ⚠️ Возможно\n     _{note}_")
+            lines.append(f"{icon} *{platform}:* ⚠️ Возможно _{note}_")
         elif res.get("found") is False:
             lines.append(f"{icon} *{platform}:* ❌ Не зарегистрирован")
         elif res.get("error"):
             lines.append(f"{icon} *{platform}:* 🔴 Ошибка: `{res['error']}`")
         else:
             lines.append(f"{icon} *{platform}:* ❓ Нет данных")
-    lines.append(f"\n📊 Проверено за *{elapsed:.1f}с*")
+    lines.append(
+        "\n📊 Проверено за *{:.1f}с*\n"
+        "ℹ️ _CryptoRank и OpenSea — Web3 платформы, email не используют_".format(elapsed)
+    )
     return "\n".join(lines)
 
 
