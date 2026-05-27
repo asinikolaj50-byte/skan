@@ -65,8 +65,11 @@ def kb_cancel():
 
 
 # ─── HOLEHE (email) ────────────────────────────────────────────────────────
+# Запускаем holehe в отдельном потоке, т.к. оно использует trio,
+# а telegram-бот работает на asyncio — они несовместимы в одном потоке.
 
-async def scan_email_holehe(email: str, timeout: int = 10) -> tuple[list, float]:
+def _holehe_sync(email: str, timeout: int = 10) -> tuple[list, float]:
+    """Синхронная обёртка — запускает trio внутри отдельного потока."""
     import importlib
     import pkgutil
     import httpx
@@ -97,26 +100,30 @@ async def scan_email_holehe(email: str, timeout: int = 10) -> tuple[list, float]
                     websites.append(modu.__dict__[site])
         return websites
 
-    async def launch(module, email, client, out):
-        try:
-            await module(email, client, out)
-        except Exception:
-            pass
+    async def _run():
+        async def launch(module, email, client, out):
+            try:
+                await module(email, client, out)
+            except Exception:
+                pass
 
-    modules = import_submodules("holehe.modules")
-    websites = get_functions(modules)
-    client = httpx.AsyncClient(timeout=timeout)
-    out = []
-    instrument = TrioProgress(len(websites))
-    trio.lowlevel.add_instrument(instrument)
+        modules = import_submodules("holehe.modules")
+        websites = get_functions(modules)
+        client = httpx.AsyncClient(timeout=timeout)
+        out = []
+        instrument = TrioProgress(len(websites))
+        trio.lowlevel.add_instrument(instrument)
+        async with trio.open_nursery() as nursery:
+            for website in websites:
+                nursery.start_soon(launch, website, email, client, out)
+        trio.lowlevel.remove_instrument(instrument)
+        out = sorted(out, key=lambda i: i.get('name', ''))
+        await client.aclose()
+        return out
+
     start = time.time()
-    async with trio.open_nursery() as nursery:
-        for website in websites:
-            nursery.start_soon(launch, website, email, client, out)
-    trio.lowlevel.remove_instrument(instrument)
+    out = trio.run(_run)           # trio.run() создаёт свой event loop — не конфликтует с asyncio
     elapsed = time.time() - start
-    out = sorted(out, key=lambda i: i.get('name', ''))
-    await client.aclose()
     return out, elapsed
 
 
@@ -213,7 +220,8 @@ async def do_email_scan(update: Update, email: str):
         parse_mode=ParseMode.MARKDOWN
     )
     try:
-        data, elapsed = await scan_email_holehe(email)
+        loop = asyncio.get_event_loop()
+        data, elapsed = await loop.run_in_executor(None, _holehe_sync, email)
         result = format_holehe(email, data, elapsed)
         await msg.delete()
         await send_long(update, result, reply_markup=kb_back())
