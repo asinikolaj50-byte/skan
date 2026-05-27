@@ -1,66 +1,119 @@
 # OSINT Combo Bot
 
-A unified OSINT tool that combines **holehe** (email OSINT) and **user-scanner** (username scanner) into a single command-line bot.
+Единый OSINT-инструмент: **holehe** (email) + **user-scanner** (username) + **Telegram-бот**.
 
-- **Email mode** — checks if an email is registered on 120+ websites using the password recovery method (based on [holehe](https://github.com/megadose/holehe))
-- **Username mode** — searches for a username across 100+ platforms (based on [user-scanner](https://github.com/kaifcodec/user-scanner))
-- **Auto-detect** — just pass an email or username and it figures out which mode to use
+- 📧 **Email-режим** — проверяет email на 120+ сайтах через функцию восстановления пароля
+- 👤 **Username-режим** — ищет никнейм на 100+ платформах
+- 🤖 **Telegram-бот** — управление через чат
 
-## Installation
+---
+
+## Установка
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/osint-combo-bot.git
+git clone https://github.com/ВАШ_НИК/osint-combo-bot.git
 cd osint-combo-bot
 pip install -r requirements.txt
 ```
 
-## Usage
+---
+
+## Запуск Telegram-бота
+
+### Локально
 
 ```bash
-# Auto-detect: email → holehe scan
-python main.py target@example.com
-
-# Auto-detect: username → user-scanner
-python main.py johndoe
-
-# Run both holehe + username scan for an email
-python main.py target@example.com --both
-
-# Only show found results (cleaner output)
-python main.py johndoe --only-found
-
-# Scan only a specific category (dev, social, gaming, etc.)
-python main.py johndoe -c dev
-
-# Skip NSFW sites
-python main.py johndoe --no-nsfw
-
-# Verbose output (show URLs)
-python main.py johndoe -v
-
-# Force email mode
-python main.py johndoe@gmail.com --mode email
-
-# Force username mode
-python main.py someuser --mode username
-
-# Set request timeout (default: 10s)
-python main.py target@example.com -t 15
+export BOT_TOKEN="токен_от_BotFather"
+python bot.py
 ```
 
-## Options
+На Windows:
+```cmd
+set BOT_TOKEN=токен_от_BotFather
+python bot.py
+```
 
-| Flag | Description |
-|------|-------------|
-| `--mode` | `auto` (default), `email`, or `username` |
-| `--both` | Run both email OSINT and username scan |
-| `--only-found` | Only show sites where the target was found |
-| `-v, --verbose` | Verbose output with URLs |
-| `-c, --category` | Scan a specific category (username mode only) |
-| `--no-nsfw` | Skip adult/NSFW platforms |
-| `-t, --timeout` | Request timeout in seconds (default: 10) |
+### На сервере (systemd)
 
-## Credits
+Создай файл `/etc/systemd/system/osint-bot.service`:
 
-- [holehe](https://github.com/megadose/holehe) by @megadose — email OSINT via password recovery
-- [user-scanner](https://github.com/kaifcodec/user-scanner) by @kaifcodec — username OSINT
+```ini
+[Unit]
+Description=OSINT Combo Bot
+After=network.target
+
+[Service]
+WorkingDirectory=/path/to/osint-combo-bot
+ExecStart=/usr/bin/python3 bot.py
+Environment=BOT_TOKEN=ВАШ_ТОКЕН
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl enable osint-bot
+sudo systemctl start osint-bot
+```
+
+---
+
+## GitHub Secrets (для GitHub Actions)
+
+1. Открой репозиторий на GitHub
+2. **Settings → Secrets and variables → Actions**
+3. Нажми **New repository secret**
+4. Имя: `BOT_TOKEN`, значение: токен от BotFather
+5. Сохрани
+
+Затем в GitHub Actions используй как:
+```yaml
+env:
+  BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+```
+
+---
+
+## Команды в Telegram
+
+| Команда | Описание |
+|---------|----------|
+| `/start` | Начало работы |
+| `/email адрес@mail.com` | Сканировать email |
+| `/user johndoe` | Сканировать username |
+| `/both адрес@mail.com` | Email + username сразу |
+| Просто написать email | Автодетект → email-сканирование |
+| Просто написать ник | Автодетект → username-сканирование |
+
+---
+
+## CLI (без Telegram)
+
+```bash
+python main.py target@example.com      # email
+python main.py johndoe                 # username
+python main.py target@example.com --both  # оба режима
+python main.py johndoe --only-found    # только найденные
+python main.py johndoe -c dev          # только категория dev
+```
+
+---
+
+## Структура
+
+```
+osint-combo-bot/
+├── bot.py           ← Telegram-бот
+├── main.py          ← CLI
+├── requirements.txt
+├── holehe/          ← email OSINT движок
+└── user_scanner/    ← username сканер
+```
+
+---
+
+## Кредиты
+
+- [holehe](https://github.com/megadose/holehe) — email OSINT
+- [user-scanner](https://github.com/kaifcodec/user-scanner) — username scanner
