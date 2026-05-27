@@ -74,7 +74,6 @@ def _holehe_sync(email: str, timeout: int = 10) -> tuple[list, float]:
     import pkgutil
     import httpx
     import trio
-    from holehe.instruments import TrioProgress
 
     def import_submodules(package, recursive=True):
         if isinstance(package, str):
@@ -111,18 +110,16 @@ def _holehe_sync(email: str, timeout: int = 10) -> tuple[list, float]:
         websites = get_functions(modules)
         client = httpx.AsyncClient(timeout=timeout)
         out = []
-        instrument = TrioProgress(len(websites))
-        trio.lowlevel.add_instrument(instrument)
+        # TrioProgress убран — он блокирует поток через tqdm и вешает скан
         async with trio.open_nursery() as nursery:
             for website in websites:
                 nursery.start_soon(launch, website, email, client, out)
-        trio.lowlevel.remove_instrument(instrument)
         out = sorted(out, key=lambda i: i.get('name', ''))
         await client.aclose()
         return out
 
     start = time.time()
-    out = trio.run(_run)           # trio.run() создаёт свой event loop — не конфликтует с asyncio
+    out = trio.run(_run)
     elapsed = time.time() - start
     return out, elapsed
 
@@ -169,9 +166,8 @@ def format_holehe(email: str, data: list, elapsed: float) -> str:
 
 
 def format_username(username: str, results: list, elapsed: float) -> str:
-    from user_scanner.core.result import Status
-
-    found = [r for r in results if r.status == Status.TAKEN]
+    # Используем is_found() вместо == Status.TAKEN — надёжнее при запуске в потоке
+    found = [r for r in results if _is_found(r)]
     lines = [f"👤 *Username:* `{username}`\n"]
 
     if found:
@@ -191,6 +187,18 @@ def format_username(username: str, results: list, elapsed: float) -> str:
 
     lines.append(f"\n📊 *{len(results)}* платформ за *{elapsed:.1f}с*")
     return "\n".join(lines)
+
+
+def _is_found(result) -> bool:
+    """Проверяет найден ли результат — работает независимо от контекста импорта."""
+    # Метод is_found() если есть
+    if hasattr(result, 'is_found'):
+        return result.is_found()
+    # Проверка по имени статуса (безопаснее чем == при разных контекстах импорта)
+    status = getattr(result, 'status', None)
+    if status is None:
+        return False
+    return getattr(status, 'name', str(status)) == 'TAKEN'
 
 
 # ─── SEND HELPERS ──────────────────────────────────────────────────────────
@@ -226,7 +234,13 @@ async def do_email_scan(update: Update, email: str):
         await msg.delete()
         await send_long(update, result, reply_markup=kb_back())
     except Exception as e:
-        await msg.edit_text(f"❌ Ошибка: `{e}`", parse_mode=ParseMode.MARKDOWN)
+        import traceback
+        tb = traceback.format_exc()
+        print(f"[EMAIL ERROR] {e}\n{tb}")
+        try:
+            await msg.edit_text(f"❌ Ошибка email-скана:\n`{type(e).__name__}: {e}`", parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await update.effective_message.reply_text(f"❌ Ошибка: `{e}`", parse_mode=ParseMode.MARKDOWN)
 
 
 async def do_username_scan(update: Update, username: str):
@@ -241,7 +255,13 @@ async def do_username_scan(update: Update, username: str):
         await msg.delete()
         await send_long(update, result, reply_markup=kb_back())
     except Exception as e:
-        await msg.edit_text(f"❌ Ошибка: `{e}`", parse_mode=ParseMode.MARKDOWN)
+        import traceback
+        tb = traceback.format_exc()
+        print(f"[USER ERROR] {e}\n{tb}")
+        try:
+            await msg.edit_text(f"❌ Ошибка username-скана:\n`{type(e).__name__}: {e}`", parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await update.effective_message.reply_text(f"❌ Ошибка: `{e}`", parse_mode=ParseMode.MARKDOWN)
 
 
 # ─── HANDLERS ──────────────────────────────────────────────────────────────
