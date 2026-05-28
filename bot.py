@@ -441,20 +441,34 @@ async def _twitter_get_username_by_email(email: str) -> str | None:
             )
             html2 = r2.text
 
-            # Ищем @username в ответе
-            patterns = [
-                r'@([A-Za-z0-9_]{1,50})',
+            # Ищем @username в ответе — ТОЛЬКО надёжные паттерны.
+            # Широкие URL-паттерны (x.com/...) не используем — слишком много ложных
+            # совпадений (x.com/forms, x.com/i, x.com/login и т.д.).
+            reliable_patterns = [
                 r'"screen_name"\s*:\s*"([A-Za-z0-9_]{1,50})"',
-                r'twitter\.com/([A-Za-z0-9_]{1,50})["\s/]',
-                r'x\.com/([A-Za-z0-9_]{1,50})["\s/]',
+                r'"username"\s*:\s*"([A-Za-z0-9_]{1,50})"',
+                r'data-screen-name="([A-Za-z0-9_]{1,50})"',
+                r'href="/([A-Za-z0-9_]{1,50})/status/',  # ссылка на твит профиля
             ]
-            skip = {"account", "login", "signup", "home", "search", "hashtag", "intent",
-                    "privacy", "tos", "settings", "i", "help"}
-            for pat in patterns:
+            # Системные пути X/Twitter — не являются usernames
+            SKIP_PATHS = {
+                "account", "login", "signup", "home", "search", "hashtag", "intent",
+                "privacy", "tos", "settings", "i", "help", "explore", "notifications",
+                "messages", "compose", "verify", "flow", "forms", "status", "oauth",
+                "widgets", "api", "about", "web", "en", "share", "redirect",
+                "download", "communities", "topics", "bookmarks", "lists", "connect",
+            }
+            for pat in reliable_patterns:
                 for m in re.finditer(pat, html2):
                     u = m.group(1)
-                    if u.lower() not in skip and len(u) >= 1:
+                    if u.lower() not in SKIP_PATHS and len(u) >= 2:
                         return u
+
+            # Паттерн @mention как последний резерв — только если окружён пробелами/тегами
+            for m in re.finditer(r'(?<![/\w])@([A-Za-z0-9_]{2,50})(?![/\w])', html2):
+                u = m.group(1)
+                if u.lower() not in SKIP_PATHS:
+                    return u
     except Exception:
         pass
     return None
