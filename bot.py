@@ -143,19 +143,53 @@ BROWSER_HEADERS = browser_headers()
 
 # ─── ПРОКСИ-ХЕЛПЕР ────────────────────────────────────────────────────────────
 
+def _normalize_proxy_url(raw: str) -> str:
+    """Нормализует URL прокси.
+
+    Проблема: если пароль содержит @, :, #, /, ? и т.д. — urlparse ломается.
+    Решение: парсим вручную, кодируем user/pass через urllib.parse.quote.
+
+    Поддерживаемые форматы:
+      socks5://user:pass@host:port
+      http://user:pass@host:port
+      socks5://host:port              (без авторизации)
+    """
+    from urllib.parse import quote, urlparse, urlunparse
+
+    raw = raw.strip()
+    # Нормализуем схему в нижний регистр (SOCKS5:// → socks5://)
+    if "://" in raw:
+        scheme, rest = raw.split("://", 1)
+        raw = scheme.lower() + "://" + rest
+
+    try:
+        p = urlparse(raw)
+        # Если нет user/pass — возвращаем как есть
+        if not p.username and not p.password:
+            return raw
+        # Кодируем спецсимволы в логине и пароле
+        user = quote(p.username or "", safe="")
+        pwd  = quote(p.password or "", safe="")
+        host = p.hostname or ""
+        port = f":{p.port}" if p.port else ""
+        netloc = f"{user}:{pwd}@{host}{port}"
+        return urlunparse((p.scheme, netloc, p.path, p.params, p.query, p.fragment))
+    except Exception:
+        return raw  # Не смогли распарсить — используем как есть
+
+
+# Нормализованный URL прокси (кодирует спецсимволы в пароле)
+_PROXY_NORMALIZED: str | None = _normalize_proxy_url(PROXY_URL) if PROXY_URL else None
+
+
 def proxy_args() -> dict:
     """Возвращает kwargs для httpx.AsyncClient с прокси (если задан PROXY_URL).
 
-    Поддерживаемые форматы PROXY_URL:
-      http://user:pass@host:port        — HTTP-прокси
-      socks5://user:pass@host:port      — SOCKS5-прокси
-      http://host:port                  — без авторизации
-
     Если PROXY_URL не задан — возвращает пустой dict (прямое соединение).
     """
-    if not PROXY_URL:
+    if not _PROXY_NORMALIZED:
         return {}
-    return {"proxy": PROXY_URL}
+    return {"proxy": _PROXY_NORMALIZED}
 
 
 def make_client(
@@ -1326,13 +1360,20 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     lines: list[str] = ["<b>🔧 Диагностика</b>\n"]
 
     # Прокси
-    if PROXY_URL:
-        # Маскируем пароль для показа
-        masked = re.sub(r'(:)([^@:/]{2})[^@/]*(@)', r'\1\2***\3', PROXY_URL)
+    if PROXY_URL and _PROXY_NORMALIZED:
+        # Маскируем пароль для показа (оставляем первые 2 символа пароля)
+        masked = re.sub(r'(:)([^@:/]{1,2})[^@]*(@)', r'\1\2***\3', _PROXY_NORMALIZED)
         lines.append(f"🌐 <b>PROXY_URL:</b> <code>{h(masked)}</code>")
+        if _PROXY_NORMALIZED != PROXY_URL:
+            lines.append("   <i>✏️ URL нормализован (спецсимволы в пароле закодированы)</i>")
     else:
         lines.append("🌐 <b>PROXY_URL:</b> ❌ не задан")
         lines.append("   <i>Без прокси Facebook/Instagram/LinkedIn/CryptoRank блокируют датацентровые IP</i>")
+        lines.append("")
+        lines.append("<b>Как добавить:</b>")
+        lines.append("GitHub → Settings → Secrets → Actions → New secret")
+        lines.append("<code>Name:  PROXY_URL</code>")
+        lines.append("<code>Value: socks5://ЛОГИН:ПАРОЛЬ@ХОСТ:ПОРТ</code>")
 
     # Тест подключения через прокси
     lines.append("")
