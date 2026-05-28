@@ -1321,6 +1321,54 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показывает статус прокси и делает тест-запрос через него."""
+    lines: list[str] = ["<b>🔧 Диагностика</b>\n"]
+
+    # Прокси
+    if PROXY_URL:
+        # Маскируем пароль для показа
+        masked = re.sub(r'(:)([^@:/]{2})[^@/]*(@)', r'\1\2***\3', PROXY_URL)
+        lines.append(f"🌐 <b>PROXY_URL:</b> <code>{h(masked)}</code>")
+    else:
+        lines.append("🌐 <b>PROXY_URL:</b> ❌ не задан")
+        lines.append("   <i>Без прокси Facebook/Instagram/LinkedIn/CryptoRank блокируют датацентровые IP</i>")
+
+    # Тест подключения через прокси
+    lines.append("")
+    lines.append("<b>Тест соединения:</b>")
+    msg = await update.message.reply_text(
+        "\n".join(lines) + "\n⏳ проверяю...",
+        parse_mode=ParseMode.HTML,
+    )
+
+    test_results: list[str] = []
+    for test_url, label in [
+        ("https://api.ipify.org?format=json", "IP через прокси"),
+        ("https://www.facebook.com/favicon.ico", "Facebook"),
+        ("https://www.instagram.com/favicon.ico", "Instagram"),
+    ]:
+        try:
+            async with make_client(timeout=10.0) as c:
+                r = await c.get(test_url)
+            if "ipify" in test_url:
+                ip = r.json().get("ip", "?")
+                test_results.append(f"  ✅ {label}: <code>{h(ip)}</code>")
+            else:
+                test_results.append(f"  ✅ {label}: HTTP {r.status_code}")
+        except Exception as e:
+            test_results.append(f"  ❌ {label}: <code>{h(str(e)[:60])}</code>")
+
+    lines += test_results
+    lines.append("")
+    if CAPTCHA_KEY:
+        lines.append("🔑 <b>CAPTCHA_API_KEY:</b> ✅ задан")
+    else:
+        lines.append("🔑 <b>CAPTCHA_API_KEY:</b> не задан (опционально)")
+
+    await msg.edit_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
 def main() -> None:
     if not BOT_TOKEN:
         raise ValueError(
@@ -1328,18 +1376,17 @@ def main() -> None:
             "Задай переменную окружения: export BOT_TOKEN='xxxxxxx:xxx...'"
         )
 
-    proxy_status = f"✅ {PROXY_URL}" if PROXY_URL else "⚠️  не задан (возможны блокировки FB/LI/CR)"
-    captcha_status = "✅ 2captcha подключён" if CAPTCHA_KEY else "⚠️  не задан (капча не решается)"
+    proxy_status = f"ЗАДАН → {PROXY_URL[:30]}..." if PROXY_URL else "НЕ ЗАДАН (блокировки FB/LI/IG/CR)"
     print("─" * 60)
     print("  OSINT Telegram Bot")
-    print(f"  PROXY_URL:       {proxy_status}")
-    print(f"  CAPTCHA_API_KEY: {captcha_status}")
-    print(f"  REQUEST_DELAY:   {FILE_DELAY}с (режим .txt-файла)")
-    print(f"  UA pool:         {len(_UA_POOL)} вариантов (ротация на каждый запрос)")
+    print(f"  PROXY_URL:  {proxy_status}")
+    print(f"  CAPTCHA:    {'задан' if CAPTCHA_KEY else 'не задан'}")
+    print(f"  DELAY:      {FILE_DELAY}с")
     print("─" * 60)
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.Document.ALL, document_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
