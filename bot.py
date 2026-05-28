@@ -361,8 +361,8 @@ def kb_cancel() -> InlineKeyboardMarkup:
 async def _check_twitter_email(email: str, _unused=None) -> dict:
     """
     Twitter/X email check.
-    GET https://api.twitter.com/i/users/email_available.json?email=...
-    {"taken": true} → зарегистрирован.
+    Шаг 1: GET email_available.json → подтверждаем что email занят.
+    Шаг 2: POST forgot-password → пробуем извлечь @username из ответа.
     Использует make_client() → случайный UA + прокси (если PROXY_URL задан).
     """
     try:
@@ -382,14 +382,82 @@ async def _check_twitter_email(email: str, _unused=None) -> dict:
             )
         if r.status_code == 200:
             d = r.json()
-            if d.get("taken") is True or d.get("reason") == "taken":
-                return {"found": True}
-            return {"found": False}
+            taken = d.get("taken") is True or d.get("reason") == "taken"
+            if not taken:
+                return {"found": False}
+            # Шаг 2: пробуем получить username через forgot-password
+            try:
+                username = await _twitter_get_username_by_email(email)
+                if username:
+                    return {"found": True, "url": f"https://x.com/{username}", "username": username}
+            except Exception:
+                pass
+            return {"found": True}
         if r.status_code == 429:
             return {"found": "rate_limit"}
         return {"error": f"Twitter: HTTP {r.status_code}"}
     except Exception as e:
         return {"error": str(e)[:80]}
+
+
+async def _twitter_get_username_by_email(email: str) -> str | None:
+    """
+    Пробует извлечь @username из Twitter forgot-password flow.
+    Возвращает username (без @) или None.
+    """
+    try:
+        async with make_client(
+            extra_headers={
+                "Accept": "text/html,application/xhtml+xml,*/*",
+                "Referer": "https://x.com/",
+            },
+            timeout=15.0,
+        ) as c:
+            # Шаг 1: получаем форму сброса пароля
+            r1 = await c.get("https://x.com/account/begin_password_reset")
+            html1 = r1.text
+
+            # Извлекаем authenticity_token
+            tok_m = (
+                re.search(r'name="authenticity_token"\s+value="([^"]+)"', html1)
+                or re.search(r'"authenticity_token"\s*:\s*"([^"]+)"', html1)
+            )
+            if not tok_m:
+                return None
+
+            # Шаг 2: отправляем email
+            r2 = await c.post(
+                "https://x.com/account/begin_password_reset",
+                data={
+                    "authenticity_token": tok_m.group(1),
+                    "account_identifier": email,
+                    "flow": "forgot_password",
+                },
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Origin": "https://x.com",
+                    "Referer": "https://x.com/account/begin_password_reset",
+                },
+            )
+            html2 = r2.text
+
+            # Ищем @username в ответе
+            patterns = [
+                r'@([A-Za-z0-9_]{1,50})',
+                r'"screen_name"\s*:\s*"([A-Za-z0-9_]{1,50})"',
+                r'twitter\.com/([A-Za-z0-9_]{1,50})["\s/]',
+                r'x\.com/([A-Za-z0-9_]{1,50})["\s/]',
+            ]
+            skip = {"account", "login", "signup", "home", "search", "hashtag", "intent",
+                    "privacy", "tos", "settings", "i", "help"}
+            for pat in patterns:
+                for m in re.finditer(pat, html2):
+                    u = m.group(1)
+                    if u.lower() not in skip and len(u) >= 1:
+                        return u
+    except Exception:
+        pass
+    return None
 
 
 def _fb_parse_accounts(html: str) -> list[dict]:
@@ -679,6 +747,27 @@ async def _check_instagram_email(email: str, _unused=None) -> dict:
         return {"error": str(e)[:80]}
 
 
+def _linkedin_extract_slug(html: str) -> str | None:
+    """
+    Пробует извлечь публичный slug профиля LinkedIn из HTML-ответа.
+    Ищет паттерны вида linkedin.com/in/<slug> в тексте страницы.
+    """
+    patterns = [
+        r'linkedin\.com/in/([A-Za-z0-9\-_%]{3,80})',
+        r'"publicIdentifier"\s*:\s*"([A-Za-z0-9\-_%]{3,80})"',
+        r'"vanityName"\s*:\s*"([A-Za-z0-9\-_%]{3,80})"',
+        r'/in/([A-Za-z0-9\-_%]{3,80})["\s/?]',
+    ]
+    skip = {"login", "signup", "register", "company", "jobs", "learning",
+            "help", "legal", "policies", "checkpoint", "uas"}
+    for pat in patterns:
+        for m in re.finditer(pat, html):
+            slug = m.group(1).strip("/ ")
+            if slug.lower() not in skip and len(slug) >= 3:
+                return slug
+    return None
+
+
 async def _check_linkedin_email(email: str, _unused=None) -> dict:
     """
     LinkedIn — два метода в одной сессии (куки метода A → метод B).
@@ -729,6 +818,11 @@ async def _check_linkedin_email(email: str, _unused=None) -> dict:
                            "email has been sent", "password-reset-email-sent", "check-email"]
                 for s in found_a:
                     if s in body2 or s in url2:
+                        # Пробуем вытащить публичную ссылку на профиль из HTML
+                        li_slug = _linkedin_extract_slug(r2.text)
+                        if li_slug:
+                            li_url = f"https://www.linkedin.com/in/{li_slug}"
+                            return {"found": True, "url": li_url}
                         return {"found": True}
 
                 not_found_a = ["member not found", "not on file", "no account",
@@ -773,10 +867,16 @@ async def _check_linkedin_email(email: str, _unused=None) -> dict:
                        "enter your password", "add-password", "challenge", "authwall"]
             for s in found_b:
                 if s in body4 or s in url4:
+                    li_slug = _linkedin_extract_slug(r4.text)
+                    if li_slug:
+                        return {"found": True, "url": f"https://www.linkedin.com/in/{li_slug}"}
                     return {"found": True}
 
             # Если LinkedIn вернул /checkpoint/ → email известен (нужна 2FA и т.п.)
             if "/checkpoint/" in url4 or "/uas/" in url4:
+                li_slug = _linkedin_extract_slug(r4.text)
+                if li_slug:
+                    return {"found": True, "url": f"https://www.linkedin.com/in/{li_slug}"}
                 return {"found": True}
 
             return {"error": "LinkedIn: неопределённый ответ"}
@@ -1126,7 +1226,15 @@ def _email_line(platform: str, res: dict) -> str:
     icon = ICONS.get(platform, "🔎")
     pname = h(platform)
     if res.get("found") is True:
-        lines = [f"{icon} <b>{pname}:</b> ✅ Зарегистрирован"]
+        lines = []
+        # Если чекер вернул прямую ссылку на профиль (Twitter forgot-password flow)
+        direct_url = res.get("url") or ""
+        direct_name = res.get("name") or ""
+        if direct_url:
+            link_text = direct_name or direct_url
+            lines.append(f"{icon} <b>{pname}:</b> ✅ {make_link(link_text, direct_url)}")
+        else:
+            lines.append(f"{icon} <b>{pname}:</b> ✅ Зарегистрирован")
         # Показываем аккаунты если есть (Facebook identify-flow)
         for acc in res.get("accounts") or []:
             acc_name = h(acc.get("name") or "")
