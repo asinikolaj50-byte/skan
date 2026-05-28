@@ -799,8 +799,8 @@ async def scan_email(email: str) -> tuple[dict, float]:
 async def _check_twitter_user(username: str) -> dict:
     """
     Twitter/X username — страница профиля.
-    404 → не найден; "account doesn't exist" → не найден; иначе → "maybe"
-    (X не отдаёт данные без авторизации, но 404 = точный сигнал).
+    404 → не найден; "account doesn't exist" → не найден;
+    200 без явных "не существует" → найден (X отдаёт 404 на несуществующие аккаунты).
     Использует make_client() → случайный UA + прокси.
     """
     url = f"https://x.com/{username}"
@@ -815,9 +815,19 @@ async def _check_twitter_user(username: str) -> dict:
             return {"found": False}
         if r.status_code == 200:
             text = r.text.lower()
-            if "account doesn" in text or ("this account" in text and "exist" in text):
+            not_found = [
+                "account doesn",
+                "this account doesn",
+                "caution: this account",
+                "suspended",
+                "@" + username.lower() + " doesn",
+            ]
+            if any(s in text for s in not_found):
                 return {"found": False}
-            return {"found": "maybe", "url": url, "note": "X требует авторизацию, проверь вручную"}
+            # 200 без сигналов отсутствия = профиль существует
+            return {"found": True, "url": url}
+        if r.status_code == 429:
+            return {"found": "rate_limit", "url": url}
         return {"error": f"Twitter: HTTP {r.status_code}"}
     except Exception as e:
         return {"error": str(e)[:80]}
@@ -950,7 +960,8 @@ async def _check_opensea_user(username: str) -> dict:
             ):
                 return {"found": True, "url": purl}
 
-            return {"found": "maybe", "url": purl, "note": "Страница загрузилась — проверь вручную"}
+            # Страница загрузилась без "not found" → профиль существует
+            return {"found": True, "url": purl}
 
         if r.status_code == 429:
             return {"found": "rate_limit", "url": purl}
@@ -1051,16 +1062,25 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await q.answer()
     data = q.data
 
+    async def safe_edit(text: str, **kwargs) -> None:
+        """edit_message_text, игнорируя 'Message is not modified' (двойной клик)."""
+        try:
+            await q.edit_message_text(text, **kwargs)
+        except Exception as exc:
+            if "not modified" in str(exc).lower():
+                return
+            raise
+
     if data == "back:main":
         context.user_data.clear()
-        await q.edit_message_text(
+        await safe_edit(
             "👋 <b>OSINT-бот</b> — выбери режим:",
             reply_markup=kb_main(),
             parse_mode=ParseMode.HTML,
         )
 
     elif data == "help":
-        text = (
+        help_text = (
             "<b>Методы проверки:</b>\n\n"
             "🐦 <b>Twitter/X</b> — email_available API (точный)\n"
             "📘 <b>Facebook</b> — forgot-password flow (точный)\n"
@@ -1072,7 +1092,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             "При email-проверке: только ✅ / ❌ — никакого «возможно»\n"
             "При username-проверке: кликабельная ссылка на профиль"
         )
-        await q.edit_message_text(text, reply_markup=kb_back(), parse_mode=ParseMode.HTML)
+        await safe_edit(help_text, reply_markup=kb_back(), parse_mode=ParseMode.HTML)
 
     elif data.startswith("mode:"):
         mode = data.split(":")[1]
@@ -1084,7 +1104,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             "both":  "Введи <b>email</b> для проверки (потом попрошу username):",
             "file":  "Отправь <code>.txt</code> файл (каждый email или username на новой строке):",
         }
-        await q.edit_message_text(
+        await safe_edit(
             prompts[mode],
             reply_markup=kb_cancel(),
             parse_mode=ParseMode.HTML,
