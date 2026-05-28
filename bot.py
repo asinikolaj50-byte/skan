@@ -702,142 +702,181 @@ def _fb_parse_accounts(html: str) -> list[dict]:
     return accounts[:5]  # Максимум 5 аккаунтов
 
 
+def _fb_extract_tokens(html: str) -> tuple[str, str]:
+    """Извлекает LSD и jazoest токены из HTML Facebook."""
+    lsd_m = (
+        re.search(r'name="lsd"\s+value="([^"]+)"', html)
+        or re.search(r'\["LSD",\[\],\{"token":"([^"]+)"\}', html)
+        or re.search(r'"lsd"\s*:\s*"([^"]{4,30})"', html)
+        or re.search(r'value="([A-Za-z0-9_\-]{6,20})"\s+name="lsd"', html)
+    )
+    j_m = (
+        re.search(r'name="jazoest"\s+value="(\d+)"', html)
+        or re.search(r'jazoest=(\d+)', html)
+    )
+    return (lsd_m.group(1) if lsd_m else ""), (j_m.group(1) if j_m else "2488")
+
+
 async def _check_facebook_email(email: str, _unused=None) -> dict:
     """
-    Facebook — identify flow (forgot-password).
-    Извлекает имя аккаунта, ссылку на профиль и фото.
+    Facebook email check — три метода по приоритету:
 
-    Шаг 1: GET /login/identify/?ctx=recover → LSD + jazoest токены
-    Шаг 2: POST email на identify → парсим аккаунты из HTML-ответа
-    Шаг 3: Fallback — registration check через /r.php
-
-    Возвращает:
-      {"found": True, "accounts": [{"name": "...", "url": "...", "photo": "..."}]}
-      {"found": False}
-      {"error": "..."}
+    1. mbasic.facebook.com/login/identify/  — упрощённая мобильная версия,
+       минимум JS-защиты, LSD всегда в HTML-форме. ОСНОВНОЙ метод.
+    2. www.facebook.com/login/identify/     — десктоп, требует корректного IP.
+    3. /r.php registration check            — финальный fallback.
     """
     try:
         await jitter(0.3, 0.8)
-        async with make_client(
-            extra_headers={"Upgrade-Insecure-Requests": "1"},
-            timeout=25.0,
-            http2=False,
-        ) as c:
 
-            # ── Шаг 1: Identify page — основной путь ──────────────────
-            r1 = await c.get(
-                "https://www.facebook.com/login/identify/",
-                params={"ctx": "recover"},
-                headers={"Referer": "https://www.google.com/"},
-            )
-            html1 = r1.text
+        def _check_not_found(body: str) -> bool:
+            signals = ["no search results", "no_results", "no accounts found",
+                       "couldn't find", "not found", "account_not_found",
+                       "no account found", "nothing matched"]
+            return any(s in body.lower() for s in signals)
 
-            def _extract_tokens(html: str) -> tuple[str, str]:
-                lsd_m = (
-                    re.search(r'\["LSD",\[\],\{"token":"([^"]+)"\}', html)
-                    or re.search(r'name="lsd"\s+value="([^"]+)"', html)
-                    or re.search(r'"lsd"\s*:\s*"([^"]+)"', html)
-                    or re.search(r'"token"\s*:\s*"([A-Za-z0-9_\-]{6,})"', html)
+        def _check_found(body: str) -> bool:
+            signals = ["these accounts matched", "account matched",
+                       "redirectPageTo", "checkpointLoginHelp",
+                       "profile.php", "facebook.com/", "recover_account"]
+            return any(s in body for s in signals)
+
+        # ── Метод 1: mbasic.facebook.com (приоритет) ─────────────────
+        # mbasic — текстовая мобильная версия без тяжёлого JS.
+        # Работает даже когда www.facebook.com блокирует IP.
+        try:
+            async with make_client(
+                mobile=True,
+                timeout=20.0,
+                http2=False,
+                extra_headers={"Upgrade-Insecure-Requests": "1"},
+            ) as c:
+                r1 = await c.get(
+                    "https://mbasic.facebook.com/login/identify/",
+                    params={"ctx": "recover"},
+                    headers={"Referer": "https://mbasic.facebook.com/"},
                 )
-                j_m = (
-                    re.search(r'name="jazoest"\s+value="(\d+)"', html)
-                    or re.search(r'jazoest=(\d+)', html)
-                )
-                return (lsd_m.group(1) if lsd_m else ""), (j_m.group(1) if j_m else "2488")
+                lsd, jazoest = _fb_extract_tokens(r1.text)
 
-            lsd, jazoest = _extract_tokens(html1)
+                if lsd:
+                    r2 = await c.post(
+                        "https://mbasic.facebook.com/login/identify/",
+                        params={"ctx": "recover"},
+                        data={
+                            "lsd": lsd,
+                            "jazoest": jazoest,
+                            "email": email,
+                            "did_submit": "1",
+                        },
+                        headers={
+                            "Content-Type": "application/x-www-form-urlencoded",
+                            "Origin": "https://mbasic.facebook.com",
+                            "Referer": "https://mbasic.facebook.com/login/identify/?ctx=recover",
+                        },
+                    )
+                    body = r2.text
+                    if _check_not_found(body):
+                        return {"found": False}
+                    if _check_found(body):
+                        return {"found": True, "accounts": _fb_parse_accounts(body)}
+                    # Нет явного сигнала — пробуем следующий метод
+        except Exception:
+            pass
 
-            # Если не нашли токены — пробуем m.facebook.com
-            if not lsd:
-                r1m = await c.get(
-                    "https://m.facebook.com/login/identify/",
+        # ── Метод 2: www.facebook.com (десктоп) ─────────────────────
+        try:
+            async with make_client(
+                extra_headers={"Upgrade-Insecure-Requests": "1"},
+                timeout=25.0,
+                http2=False,
+            ) as c:
+                # Сначала пробуем desktop
+                r1 = await c.get(
+                    "https://www.facebook.com/login/identify/",
                     params={"ctx": "recover"},
                     headers={"Referer": "https://www.google.com/"},
                 )
-                lsd, jazoest = _extract_tokens(r1m.text)
+                lsd, jazoest = _fb_extract_tokens(r1.text)
+
+                # Если desktop не дал токен — пробуем m.facebook.com
                 if not lsd:
-                    return {"error": "FB: нет LSD токена — IP сервера заблокирован Facebook"}
+                    r1m = await c.get(
+                        "https://m.facebook.com/login/identify/",
+                        params={"ctx": "recover"},
+                        headers={"Referer": "https://www.google.com/"},
+                    )
+                    lsd, jazoest = _fb_extract_tokens(r1m.text)
 
-            # ── Шаг 2: Отправляем email в identify ────────────────────
-            r2 = await c.post(
-                "https://www.facebook.com/login/identify/",
-                params={"ctx": "recover"},
-                data={
-                    "lsd": lsd,
-                    "jazoest": jazoest,
-                    "email": email,
-                    "did_submit": "1",
-                    "__a": "1",
-                    "__req": "2",
-                    "__user": "0",
-                },
-                headers={
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Origin": "https://www.facebook.com",
-                    "Referer": "https://www.facebook.com/login/identify/?ctx=recover",
-                    "x-fb-lsd": lsd,
-                    "x-requested-with": "XMLHttpRequest",
-                    "sec-fetch-site": "same-origin",
-                    "sec-fetch-mode": "cors",
-                    "sec-fetch-dest": "empty",
-                },
-            )
-            body2 = r2.text
+                if lsd:
+                    r2 = await c.post(
+                        "https://www.facebook.com/login/identify/",
+                        params={"ctx": "recover"},
+                        data={
+                            "lsd": lsd, "jazoest": jazoest, "email": email,
+                            "did_submit": "1", "__a": "1", "__req": "2", "__user": "0",
+                        },
+                        headers={
+                            "Content-Type": "application/x-www-form-urlencoded",
+                            "Origin": "https://www.facebook.com",
+                            "Referer": "https://www.facebook.com/login/identify/?ctx=recover",
+                            "x-fb-lsd": lsd,
+                            "x-requested-with": "XMLHttpRequest",
+                            "sec-fetch-site": "same-origin",
+                            "sec-fetch-mode": "cors",
+                        },
+                    )
+                    body = r2.text
+                    if _check_not_found(body):
+                        return {"found": False}
+                    if _check_found(body):
+                        return {"found": True, "accounts": _fb_parse_accounts(body)}
+        except Exception:
+            pass
 
-            # Явный сигнал — аккаунт не найден
-            not_found_signals = [
-                "No search results", "no_results", "no accounts found",
-                "couldn't find", "not found", "ACCOUNT_NOT_FOUND",
-            ]
-            if any(s.lower() in body2.lower() for s in not_found_signals):
-                return {"found": False}
-
-            # Явный сигнал — аккаунт найден
-            found_signals = [
-                "These accounts matched", "account matched",
-                "redirectPageTo", "checkpointLoginHelp",
-                "profile.php", "facebook.com/",
-            ]
-            if any(s in body2 for s in found_signals):
-                accounts = _fb_parse_accounts(body2)
-                return {"found": True, "accounts": accounts}
-
-            # ── Шаг 3: Fallback — registration check ──────────────────
-            r3 = await c.get(
-                "https://www.facebook.com/r.php",
-                headers={"Referer": "https://www.google.com/"},
-            )
-            lsd3, jazoest3 = _extract_tokens(r3.text)
-            if lsd3:
-                r4 = await c.post(
-                    "https://www.facebook.com/api/v1/web/accounts/web_create_ajax/attempt/",
-                    data={
-                        "jazoest": jazoest3,
-                        "lsd": lsd3,
-                        "email": email,
-                        "username": rand_str(14),
-                        "first_name": "Test",
-                        "opt_into_one_tap": "false",
-                    },
-                    headers={
-                        "Content-Type": "application/x-www-form-urlencoded",
-                        "Origin": "https://www.facebook.com",
-                        "Referer": "https://www.facebook.com/r.php",
-                        "x-fb-lsd": lsd3,
-                        "sec-fetch-site": "same-origin",
-                        "sec-fetch-mode": "cors",
-                        "sec-fetch-dest": "empty",
-                    },
+        # ── Метод 3: /r.php registration check ──────────────────────
+        try:
+            async with make_client(timeout=20.0, http2=False) as c:
+                r3 = await c.get(
+                    "https://www.facebook.com/r.php",
+                    headers={"Referer": "https://www.google.com/"},
                 )
-                body4 = r4.text
-                if "email_is_taken" in body4 or "EMAIL_IS_TAKEN" in body4:
-                    return {"found": True, "accounts": []}
-                if "email_sharing_limit" in body4:
-                    return {"found": True, "accounts": []}
-                if '"status":"ok"' in body4 or '"errors":{}' in body4:
-                    return {"found": False}
+                lsd3, jazoest3 = _fb_extract_tokens(r3.text)
+                if not lsd3:
+                    # последняя попытка через mbasic register
+                    r3m = await c.get(
+                        "https://mbasic.facebook.com/r.php",
+                        headers={"Referer": "https://mbasic.facebook.com/"},
+                    )
+                    lsd3, jazoest3 = _fb_extract_tokens(r3m.text)
 
-            return {"error": "FB: неопределённый ответ (возможно IP блокируется)"}
+                if lsd3:
+                    r4 = await c.post(
+                        "https://www.facebook.com/api/v1/web/accounts/web_create_ajax/attempt/",
+                        data={
+                            "jazoest": jazoest3, "lsd": lsd3,
+                            "email": email, "username": rand_str(14),
+                            "first_name": "Test", "opt_into_one_tap": "false",
+                        },
+                        headers={
+                            "Content-Type": "application/x-www-form-urlencoded",
+                            "Origin": "https://www.facebook.com",
+                            "Referer": "https://www.facebook.com/r.php",
+                            "x-fb-lsd": lsd3,
+                            "sec-fetch-site": "same-origin",
+                            "sec-fetch-mode": "cors",
+                        },
+                    )
+                    body4 = r4.text
+                    if "email_is_taken" in body4 or "EMAIL_IS_TAKEN" in body4:
+                        return {"found": True, "accounts": []}
+                    if "email_sharing_limit" in body4:
+                        return {"found": True, "accounts": []}
+                    if '"status":"ok"' in body4 or '"errors":{}' in body4:
+                        return {"found": False}
+        except Exception:
+            pass
+
+        return {"error": "FB: все методы не дали результата — проверь работу прокси (/status)"}
 
     except Exception as e:
         return {"error": str(e)[:80]}
@@ -916,118 +955,128 @@ def _linkedin_extract_slug(html: str) -> str | None:
     return None
 
 
+def _li_extract_csrf(html: str) -> str:
+    """Извлекает CSRF-токен LinkedIn из HTML — проверяет несколько форматов."""
+    for pat in [
+        r'name="loginCsrfParam"\s+value="([^"]+)"',
+        r'"loginCsrfParam"\s*:\s*"([^"]+)"',
+        r'name="csrfToken"\s+value="([^"]+)"',
+        r'"csrfToken"\s*:\s*"([^"]+)"',
+        r'name="loginCsrfParam"\s*value="([^"]+)"',
+        r'<input[^>]+name="csrf-token"[^>]+value="([^"]+)"',
+        r'"csrf-token"\s*content="([^"]+)"',
+    ]:
+        m = re.search(pat, html)
+        if m:
+            return m.group(1)
+    return ""
+
+
 async def _check_linkedin_email(email: str, _unused=None) -> dict:
     """
-    LinkedIn — два метода в одной сессии (куки метода A → метод B).
+    LinkedIn email check — четыре метода по приоритету.
 
-    Метод A (forgot-password):
-      GET /checkpoint/lg/forgot-password → POST /reset-password-init
-      "check your email" → найден; "member not found" → не найден.
-
-    Метод B (login-form fallback):
-      GET /login → POST /login-submit с неверным паролем
-      "wrong password" / redirect → найден; "don't recognize" → не найден.
-
-    Использует make_client() → случайный desktop Chrome UA + прокси.
+    A. GET /checkpoint/lg/forgot-password → POST reset-password-init
+       ("check your email" → найден)
+    B. GET /login → POST login-submit (неверный пароль → ошибка пароля = найден)
+    C. GET /uas/login → POST /uas/login-submit (старый эндпоинт)
+    D. GET /login?fromSignIn=true → попытка с другим CSRF
     """
     try:
         await jitter(0.4, 0.8)
-        async with make_client(
-            timeout=20.0,
-            http2=False,  # LinkedIn работает стабильнее на HTTP/1.1
-        ) as c:
 
-            # ── Метод A: forgot-password ──────────────────────────────
-            r1 = await c.get("https://www.linkedin.com/checkpoint/lg/forgot-password")
-            csrf_m = (
-                re.search(r'name="loginCsrfParam"\s+value="([^"]+)"', r1.text)
-                or re.search(r'"loginCsrfParam"\s*:\s*"([^"]+)"', r1.text)
-                or re.search(r'name="csrfToken"\s+value="([^"]+)"', r1.text)
-            )
+        found_signals_url   = ["password-reset-email-sent", "check-email", "reset-sent"]
+        found_signals_body  = ["we sent", "check your email", "reset link", "email has been sent",
+                               "we'll send", "you'll receive"]
+        notfound_signals    = ["member not found", "not on file", "no account",
+                               "couldn't find", "don't have an account", "unknown_email",
+                               "no linkedin account", "not registered"]
+        pw_wrong_signals    = ["wrong password", "incorrect password", "too many incorrect",
+                               "add-password", "challenge", "authwall", "enter your password",
+                               "sign in was blocked"]
+        pw_notfound_signals = ["don't recognize", "doesn't recognize", "hmm, that", "no account"]
 
-            if csrf_m:
-                r2 = await c.post(
-                    "https://www.linkedin.com/checkpoint/lg/reset-password-init",
-                    data={
-                        "session_key": email,
-                        "loginCsrfParam": csrf_m.group(1),
-                        "isJsEnabled": "false",
-                    },
-                    headers={
-                        "Content-Type": "application/x-www-form-urlencoded",
-                        "Origin": "https://www.linkedin.com",
-                        "Referer": "https://www.linkedin.com/checkpoint/lg/forgot-password",
-                    },
-                )
-                body2 = r2.text.lower()
-                url2 = str(r2.url).lower()
+        # Список GET-URL для получения CSRF токена (пробуем по очереди)
+        csrf_sources = [
+            ("https://www.linkedin.com/checkpoint/lg/forgot-password",
+             "https://www.linkedin.com/checkpoint/lg/reset-password-init",
+             "forgot-password"),
+            ("https://www.linkedin.com/login",
+             "https://www.linkedin.com/checkpoint/lg/login-submit",
+             "login"),
+            ("https://www.linkedin.com/uas/login",
+             "https://www.linkedin.com/uas/login-submit",
+             "uas-login"),
+            ("https://www.linkedin.com/login?fromSignIn=true&trk=guest_homepage-basic_nav-header-signin",
+             "https://www.linkedin.com/checkpoint/lg/login-submit",
+             "login-trk"),
+        ]
 
-                found_a = ["we sent", "check your email", "reset link",
-                           "email has been sent", "password-reset-email-sent", "check-email"]
-                for s in found_a:
-                    if s in body2 or s in url2:
-                        # Пробуем вытащить публичную ссылку на профиль из HTML
-                        li_slug = _linkedin_extract_slug(r2.text)
-                        if li_slug:
-                            li_url = f"https://www.linkedin.com/in/{li_slug}"
-                            return {"found": True, "url": li_url}
-                        return {"found": True}
+        async with make_client(timeout=22.0, http2=False) as c:
+            csrf = ""
+            get_url = ""
 
-                not_found_a = ["member not found", "not on file", "no account",
-                               "couldn't find", "don't have an account", "unknown_email"]
-                for s in not_found_a:
-                    if s in body2 or s in url2:
-                        return {"found": False}
+            # Ищем любой рабочий источник CSRF
+            for src_url, post_url, mode in csrf_sources:
+                try:
+                    r = await c.get(src_url, headers={"Referer": "https://www.google.com/"})
+                    csrf = _li_extract_csrf(r.text)
+                    if csrf:
+                        get_url = src_url
+                        # ── Метод A: forgot-password ──────────────────────────
+                        if mode == "forgot-password":
+                            r2 = await c.post(
+                                post_url,
+                                data={"session_key": email, "loginCsrfParam": csrf,
+                                      "isJsEnabled": "false"},
+                                headers={
+                                    "Content-Type": "application/x-www-form-urlencoded",
+                                    "Origin": "https://www.linkedin.com",
+                                    "Referer": src_url,
+                                },
+                            )
+                            body2 = r2.text.lower()
+                            url2  = str(r2.url).lower()
+                            if any(s in url2 for s in found_signals_url):
+                                slug = _linkedin_extract_slug(r2.text)
+                                return {"found": True, "url": f"https://www.linkedin.com/in/{slug}"} if slug else {"found": True}
+                            if any(s in body2 for s in found_signals_body):
+                                slug = _linkedin_extract_slug(r2.text)
+                                return {"found": True, "url": f"https://www.linkedin.com/in/{slug}"} if slug else {"found": True}
+                            if any(s in body2 for s in notfound_signals):
+                                return {"found": False}
 
-            # ── Метод B: login form (fallback) ────────────────────────
-            r3 = await c.get("https://www.linkedin.com/login")
-            csrf2_m = (
-                re.search(r'name="loginCsrfParam"\s+value="([^"]+)"', r3.text)
-                or re.search(r'"loginCsrfParam"\s*:\s*"([^"]+)"', r3.text)
-            )
-            if not csrf2_m:
-                return {"error": "LinkedIn: не удалось получить CSRF (возможно блокировка IP)"}
+                        # ── Метод B/C/D: login form ───────────────────────────
+                        else:
+                            r4 = await c.post(
+                                post_url,
+                                data={"session_key": email,
+                                      "session_password": "Wr0ng_Pa55w0rd_Pr0be_x9!",
+                                      "loginCsrfParam": csrf, "isJsEnabled": "false"},
+                                headers={
+                                    "Content-Type": "application/x-www-form-urlencoded",
+                                    "Origin": "https://www.linkedin.com",
+                                    "Referer": src_url,
+                                },
+                            )
+                            body4 = r4.text.lower()
+                            url4  = str(r4.url).lower()
+                            if any(s in body4 for s in pw_notfound_signals):
+                                return {"found": False}
+                            if any(s in body4 or s in url4 for s in pw_wrong_signals):
+                                slug = _linkedin_extract_slug(r4.text)
+                                return {"found": True, "url": f"https://www.linkedin.com/in/{slug}"} if slug else {"found": True}
+                            if "/checkpoint/" in url4 or "/uas/" in url4:
+                                slug = _linkedin_extract_slug(r4.text)
+                                return {"found": True, "url": f"https://www.linkedin.com/in/{slug}"} if slug else {"found": True}
+                        break  # если получили CSRF и попробовали — выходим
+                except Exception:
+                    continue
 
-            r4 = await c.post(
-                "https://www.linkedin.com/checkpoint/lg/login-submit",
-                data={
-                    "session_key": email,
-                    "session_password": "Wr0ng_Pa55w0rd_Pr0be_x9!2024",
-                    "loginCsrfParam": csrf2_m.group(1),
-                    "isJsEnabled": "false",
-                },
-                headers={
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Origin": "https://www.linkedin.com",
-                    "Referer": "https://www.linkedin.com/login",
-                },
-            )
-            body4 = r4.text.lower()
-            url4 = str(r4.url).lower()
+            if not csrf:
+                return {"error": "LinkedIn: не удалось получить CSRF ни с одного эндпоинта — проверь прокси (/status)"}
 
-            not_found_b = ["don't recognize", "doesn't recognize",
-                           "unknown_email", "no account", "hmm, that"]
-            for s in not_found_b:
-                if s in body4:
-                    return {"found": False}
-
-            found_b = ["wrong password", "incorrect password", "too many incorrect",
-                       "enter your password", "add-password", "challenge", "authwall"]
-            for s in found_b:
-                if s in body4 or s in url4:
-                    li_slug = _linkedin_extract_slug(r4.text)
-                    if li_slug:
-                        return {"found": True, "url": f"https://www.linkedin.com/in/{li_slug}"}
-                    return {"found": True}
-
-            # Если LinkedIn вернул /checkpoint/ → email известен (нужна 2FA и т.п.)
-            if "/checkpoint/" in url4 or "/uas/" in url4:
-                li_slug = _linkedin_extract_slug(r4.text)
-                if li_slug:
-                    return {"found": True, "url": f"https://www.linkedin.com/in/{li_slug}"}
-                return {"found": True}
-
-            return {"error": "LinkedIn: неопределённый ответ"}
+        return {"error": "LinkedIn: неопределённый ответ"}
 
     except Exception as e:
         return {"error": str(e)[:80]}
@@ -1037,41 +1086,67 @@ async def _check_discord_email(email: str, _unused=None) -> dict:
     """
     Discord — registration API v10.
     EMAIL_ALREADY_REGISTERED → зарегистрирован.
-    Использует make_client() → случайный UA + прокси.
+
+    ⚠️ Discord не имеет публичных профилей по email.
+    Ссылка на аккаунт вида discord.com/users/<id> требует знания числового ID,
+    который API регистрации не раскрывает. Только факт существования аккаунта.
     """
     try:
         await jitter(0.2, 0.5)
+        # Шаг 1: получаем fingerprint — снижает вероятность captcha
+        fingerprint = ""
+        try:
+            async with make_client(timeout=10.0) as fc:
+                fr = await fc.get(
+                    "https://discord.com/api/v10/experiments",
+                    headers={"Accept": "*/*", "Origin": "https://discord.com"},
+                )
+                fp_data = fr.json()
+                fingerprint = fp_data.get("fingerprint", "")
+        except Exception:
+            pass
+
         async with make_client(
             extra_headers={
                 "Content-Type": "application/json",
                 "Accept": "*/*",
                 "Origin": "https://discord.com",
                 "Referer": "https://discord.com/register",
+                "X-Super-Properties": "eyJvcyI6IldpbmRvd3MiLCJicm93c2VyIjoiQ2hyb21lIiwiZGV2aWNlIjoiIiwic3lzdGVtX2xvY2FsZSI6ImVuLVVTIiwiYnJvd3Nlcl91c2VyX2FnZW50IjoiTW96aWxsYS81LjAgKFdpbmRvd3MgTlQgMTAuMDsgV2luNjQ7IHg2NCkgQXBwbGVXZWJLaXQvNTM3LjM2IChLSFRNTCwgbGlrZSBHZWNrbykgQ2hyb21lLzEyNC4wLjAuMCBTYWZhcmkvNTM3LjM2IiwiYnJvd3Nlcl92ZXJzaW9uIjoiMTI0LjAuMC4wIiwib3NfdmVyc2lvbiI6IjEwIiwicmVmZXJyZXIiOiIiLCJyZWZlcnJpbmdfZG9tYWluIjoiIiwicmVmZXJyZXJfY3VycmVudCI6IiIsInJlZmVycmluZ19kb21haW5fY3VycmVudCI6IiIsInJlbGVhc2VfY2hhbm5lbCI6InN0YWJsZSIsImNsaWVudF9idWlsZF9udW1iZXIiOjI5NTM4NSwiY2xpZW50X2V2ZW50X3NvdXJjZSI6bnVsbH0=",
             },
-            timeout=12.0,
+            timeout=15.0,
         ) as c:
+            payload: dict = {
+                "fingerprint": fingerprint,
+                "email": email,
+                "username": rand_str(16),
+                "password": rand_str(20),
+                "consent": True,
+                "date_of_birth": "1995-01-15",
+                "gift_code_sku_id": None,
+                "captcha_key": None,
+            }
             r = await c.post(
                 "https://discord.com/api/v10/auth/register",
-                json={
-                    "fingerprint": "",
-                    "email": email,
-                    "username": rand_str(16),
-                    "password": rand_str(20),
-                    "consent": True,
-                    "date_of_birth": "1995-01-01",
-                    "gift_code_sku_id": None,
-                    "captcha_key": None,
-                },
+                json=payload,
             )
+
         d = r.json()
         if r.status_code in (200, 400):
             errs = d.get("errors", {}).get("email", {}).get("_errors", [])
             if errs:
-                if errs[0].get("code") == "EMAIL_ALREADY_REGISTERED":
-                    return {"found": True}
+                code = errs[0].get("code", "")
+                if code == "EMAIL_ALREADY_REGISTERED":
+                    # Discord не даёт публичную ссылку на профиль по email —
+                    # профили доступны только по числовому User ID
+                    return {"found": True, "note": "ссылка недоступна (Discord скрывает ID)"}
                 return {"found": False}
-            if d.get("captcha_key"):
+            # captcha → rate limit
+            if d.get("captcha_key") or d.get("captcha_sitekey"):
                 return {"found": "rate_limit"}
+            # Успешная регистрация (аккаунт НЕ существовал) → нет
+            if d.get("token"):
+                return {"found": False}
             return {"found": False}
         if r.status_code == 429:
             return {"found": "rate_limit"}
@@ -1082,27 +1157,70 @@ async def _check_discord_email(email: str, _unused=None) -> dict:
 
 async def _check_cryptorank_email(email: str, _unused=None) -> dict:
     """
-    CryptoRank — XSRF-TOKEN сессия + прокси.
+    CryptoRank — XSRF-TOKEN сессия.
 
-    Шаг 1: GET cryptorank.io/ → получаем XSRF-TOKEN cookie
-    Шаг 2: POST /api/v0/auth/reset-password с X-XSRF-TOKEN заголовком
-      {"success": true}             → найден
-      {"message": "User not found"} → не найден
-      403 повторно                  → пробуем v1 / forgot-password endpoints
+    Шаг 1: GET cryptorank.io/  +  GET cryptorank.io/login → XSRF-TOKEN cookie
+            Если куки нет в ответе — ищем в HTML (meta/script тегах).
+    Шаг 2: POST auth/reset-password (v0 → v1 → forgot-password) с токеном.
     """
     try:
         await jitter(0.3, 0.7)
+
+        def _parse_result(r_: httpx.Response) -> dict | None:
+            if r_.status_code in (200, 201):
+                try:
+                    d = r_.json()
+                except Exception:
+                    return None
+                if d.get("success") is True or d.get("ok") is True:
+                    return {"found": True}
+                msg = (d.get("message") or d.get("error") or "").lower()
+                if any(s in msg for s in ["not found", "no user", "not exist", "not registered"]):
+                    return {"found": False}
+                if any(s in msg for s in ["too many", "rate limit", "throttle"]):
+                    return {"found": "rate_limit"}
+                return {"found": True}   # успешный ответ без явного "not found"
+            if r_.status_code == 404:
+                return {"found": False}
+            if r_.status_code == 422:
+                return {"found": False}
+            if r_.status_code == 429:
+                return {"found": "rate_limit"}
+            return None  # 403 или другие → попробуем следующий эндпоинт
+
         async with make_client(
             extra_headers={
                 "Accept": "application/json, text/plain, */*",
                 "Origin": "https://cryptorank.io",
                 "Referer": "https://cryptorank.io/",
             },
-            timeout=15.0,
+            timeout=18.0,
         ) as c:
-            # Шаг 1: получаем XSRF-TOKEN из cookies
-            await c.get("https://cryptorank.io/")
-            xsrf = c.cookies.get("XSRF-TOKEN") or c.cookies.get("xsrf-token") or ""
+            # ── Шаг 1: получаем XSRF-TOKEN ───────────────────────────
+            # Пробуем несколько страниц — иногда cookie выставляется не сразу
+            for init_url in [
+                "https://cryptorank.io/",
+                "https://cryptorank.io/login",
+                "https://cryptorank.io/signup",
+            ]:
+                try:
+                    rp = await c.get(init_url, headers={"Accept": "text/html"})
+                    xsrf = (
+                        c.cookies.get("XSRF-TOKEN")
+                        or c.cookies.get("xsrf-token")
+                        or c.cookies.get("_xsrf")
+                        or ""
+                    )
+                    if not xsrf:
+                        # Иногда токен закопан в HTML
+                        m = re.search(r'xsrf[_\-]?token["\']?\s*[=:]\s*["\']([^"\']{10,})', rp.text, re.I)
+                        if m:
+                            xsrf = m.group(1)
+                    if xsrf:
+                        break
+                    await asyncio.sleep(0.4)
+                except Exception:
+                    continue
 
             api_headers = {
                 "Content-Type": "application/json",
@@ -1110,39 +1228,27 @@ async def _check_cryptorank_email(email: str, _unused=None) -> dict:
                 "X-Requested-With": "XMLHttpRequest",
             }
 
-            # Шаг 2: пробуем endpoints по очереди
+            # ── Шаг 2: пробуем эндпоинты ─────────────────────────────
             for endpoint in [
                 "https://cryptorank.io/api/v0/auth/reset-password",
                 "https://cryptorank.io/api/v1/auth/reset-password",
                 "https://cryptorank.io/api/v0/auth/forgot-password",
+                "https://cryptorank.io/api/v1/auth/forgot-password",
             ]:
                 try:
                     r = await c.post(endpoint, json={"email": email}, headers=api_headers)
-                    if r.status_code == 403:
+                    res = _parse_result(r)
+                    if res is not None:
+                        return res
+                    # 403 без XSRF → пробуем обновить токен и повторить
+                    if r.status_code == 403 and not xsrf:
                         continue
-                    if r.status_code in (200, 201):
-                        d = r.json()
-                        if d.get("success") is True or d.get("ok") is True:
-                            return {"found": True}
-                        msg = (d.get("message") or d.get("error") or "").lower()
-                        if any(s in msg for s in ["not found", "no user", "not exist", "not registered"]):
-                            return {"found": False}
-                        if any(s in msg for s in ["too many", "rate limit"]):
-                            return {"found": "rate_limit"}
-                        # success=false без явного "not found" — двусмысленно
-                        # Скорее всего нашёл и отправил письмо
-                        return {"found": True}
-                    if r.status_code == 404:
-                        return {"found": False}
-                    if r.status_code == 422:
-                        # Unprocessable: email валидный, но не найден
-                        return {"found": False}
-                    if r.status_code == 429:
-                        return {"found": "rate_limit"}
                 except Exception:
                     continue
 
-            return {"error": "CryptoRank: все endpoints вернули 403 (нет XSRF или блокировка)"}
+            if not xsrf:
+                return {"error": "CryptoRank: не удалось получить XSRF cookie — проверь прокси (/status)"}
+            return {"error": "CryptoRank: все endpoints вернули 403 (IP заблокирован)"}
 
     except Exception as e:
         return {"error": str(e)[:80]}
