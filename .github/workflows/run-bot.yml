@@ -1,7 +1,7 @@
 name: Run OSINT Telegram Bot
 
 on:
-  workflow_dispatch:  # запускать вручную
+  workflow_dispatch:  # запускать вручную через GitHub Actions → Run workflow
 
 jobs:
   run-bot:
@@ -20,5 +20,17 @@ jobs:
 
       - name: Run bot
         env:
+          # Обязательно (Settings → Secrets → Actions → New repository secret):
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+
+          # Опционально — прокси для обхода блокировок FB/LinkedIn/CryptoRank.
+          # Форматы: http://user:pass@host:port  или  socks5://user:pass@host:port
+          # Если не задан — запросы идут напрямую (датацентровые IP часто блокируются).
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+
+          # Опционально — ключ 2captcha.com для авторешения капч.
+          CAPTCHA_API_KEY: ${{ secrets.CAPTCHA_API_KEY }}
+
+          # Задержка между строками в .txt-файле (секунды, по умолчанию 2.0).
+          REQUEST_DELAY: "2.0"
         run: python bot.py
