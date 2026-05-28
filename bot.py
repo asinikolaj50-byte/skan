@@ -41,6 +41,22 @@ import time
 
 import httpx
 
+# ─── ПРОВЕРКА SOCKS-ПОДДЕРЖКИ ──────────────────────────────────────────────────
+# socks5:// и socks5h:// работают только если установлен пакет socksio.
+# Без него httpx молча игнорирует прокси → все запросы идут напрямую.
+try:
+    import socksio as _socksio  # noqa: F401
+    _SOCKS_AVAILABLE = True
+except ImportError:
+    _SOCKS_AVAILABLE = False
+    import warnings
+    warnings.warn(
+        "\n⚠️  socksio НЕ установлен — SOCKS-прокси не будет работать!\n"
+        "   Установи: pip install httpx[socks]\n"
+        "   Без прокси Facebook/Instagram/LinkedIn блокируют датацентровые IP.",
+        stacklevel=1,
+    )
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -392,7 +408,9 @@ async def _check_twitter_email(email: str, _unused=None) -> dict:
                     return {"found": True, "url": f"https://x.com/{username}", "username": username}
             except Exception:
                 pass
-            return {"found": True}
+            # Username не удалось извлечь (Twitter требует JS) — возвращаем
+            # ссылку на поиск по email-домену как вспомогательную информацию.
+            return {"found": True, "note": "username не удалось получить (Twitter требует JS)"}
         if r.status_code == 429:
             return {"found": "rate_limit"}
         return {"error": f"Twitter: HTTP {r.status_code}"}
@@ -400,11 +418,151 @@ async def _check_twitter_email(email: str, _unused=None) -> dict:
         return {"error": str(e)[:80]}
 
 
+# Публичный Bearer-токен Twitter/X (вшит в JS-клиент, не требует авторизации)
+_TW_BEARER = (
+    "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs"
+    "%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
+)
+
+_TW_SKIP = {
+    "account", "login", "signup", "home", "search", "hashtag", "intent",
+    "privacy", "tos", "settings", "i", "help", "explore", "notifications",
+    "messages", "compose", "verify", "flow", "forms", "status", "oauth",
+    "widgets", "api", "about", "web", "en", "share", "redirect",
+    "download", "communities", "topics", "bookmarks", "lists", "connect",
+    "null", "true", "false", "undefined",
+}
+
+
+def _tw_extract_username(data: object) -> str | None:
+    """Рекурсивно ищет screen_name / username в JSON-структуре."""
+    if isinstance(data, dict):
+        for key in ("screen_name", "username", "user_name", "screenName"):
+            val = data.get(key)
+            if isinstance(val, str) and 2 <= len(val) <= 50:
+                if re.match(r'^[A-Za-z0-9_]+$', val) and val.lower() not in _TW_SKIP:
+                    return val
+        for v in data.values():
+            r = _tw_extract_username(v)
+            if r:
+                return r
+    elif isinstance(data, list):
+        for item in data:
+            r = _tw_extract_username(item)
+            if r:
+                return r
+    return None
+
+
 async def _twitter_get_username_by_email(email: str) -> str | None:
     """
-    Пробует извлечь @username из Twitter forgot-password flow.
+    Извлекает @username через официальный Twitter/X onboarding API.
+    Использует публичный Bearer token + guest token — авторизация не нужна.
     Возвращает username (без @) или None.
     """
+    try:
+        async with make_client(
+            http2=True,
+            timeout=20.0,
+            extra_headers={
+                "Authorization": f"Bearer {_TW_BEARER}",
+                "Origin": "https://x.com",
+                "Referer": "https://x.com/i/flow/forgot-password",
+                "x-twitter-active-user": "yes",
+                "x-twitter-client-language": "en",
+                "x-twitter-client-version": "Twitter-TweetDeck-blackbird-chrome/4.0.220811.0 web/",
+            },
+        ) as c:
+            # ── Шаг 1: Получаем guest token ──────────────────────────────
+            r_g = await c.post(
+                "https://api.twitter.com/1.1/guest/activate.json",
+                content=b"",
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            if r_g.status_code != 200:
+                return None
+            guest_token = r_g.json().get("guest_token", "")
+            if not guest_token:
+                return None
+
+            c.headers.update({"x-guest-token": guest_token})
+
+            # ── Шаг 2: Инициируем forgot-password flow ───────────────────
+            r_init = await c.post(
+                "https://api.twitter.com/1.1/onboarding/task.json"
+                "?flow_name=forgot-password&api_version=1&known_device_token=&sim_country_code=",
+                json={
+                    "input_flow_data": {
+                        "flow_context": {
+                            "debug_overrides": {},
+                            "start_location": {"location": "forgot_password_link"},
+                        }
+                    },
+                    "subtask_versions": {
+                        "action_list": 2, "alert_dialog": 1,
+                        "app_download_cta": 1, "check_logged_in_account": 1,
+                        "choice_selection": 3, "contacts_live_sync_permission_prompt": 0,
+                        "cta": 7, "email_verification": 2, "end_flow": 1, "enter_date": 1,
+                        "enter_email": 2, "enter_password": 5, "enter_phone": 2,
+                        "enter_recaptcha": 1, "enter_text": 5, "enter_username": 2,
+                        "generic_urt": 3, "in_app_notification": 1, "interest_picker": 3,
+                        "js_instrumentation": 1, "menu_dialog": 1, "notifications_permission_prompt": 2,
+                        "open_account": 2, "open_home_timeline": 1, "open_link": 1,
+                        "phone_verification": 4, "privacy_options": 1, "security_key": 3,
+                        "select_avatar": 4, "select_banner": 2, "settings_list": 7,
+                        "show_code": 1, "sign_up": 2, "sign_up_review": 4, "tweet_selection_urt": 1,
+                        "update_users": 1, "upload_media": 1, "user_recommendations_list": 4,
+                        "user_recommendations_urt": 1, "wait_spinner": 3, "web_modal": 1,
+                    },
+                },
+            )
+            if r_init.status_code != 200:
+                return None
+
+            d_init = r_init.json()
+            flow_token = d_init.get("flow_token", "")
+            if not flow_token:
+                return None
+
+            # ── Шаг 3: Отправляем email ──────────────────────────────────
+            r_em = await c.post(
+                "https://api.twitter.com/1.1/onboarding/task.json",
+                json={
+                    "flow_token": flow_token,
+                    "subtask_inputs": [
+                        {
+                            "subtask_id": "ForgotPasswordPrimaryItem",
+                            "enter_text": {"text": email, "link": "next_link"},
+                        }
+                    ],
+                },
+            )
+            if r_em.status_code not in (200, 400):
+                return None
+
+            d_em = r_em.json()
+
+            # Ищем username в JSON-структуре рекурсивно
+            username = _tw_extract_username(d_em)
+            if username:
+                return username
+
+            # Запасной вариант: regex по строковому представлению
+            raw = str(d_em)
+            for pat in [
+                r'"screen_name"\s*:\s*"([A-Za-z0-9_]{2,50})"',
+                r'"username"\s*:\s*"([A-Za-z0-9_]{2,50})"',
+                r'@([A-Za-z0-9_]{2,50})',
+            ]:
+                for m in re.finditer(pat, raw):
+                    u = m.group(1)
+                    if u.lower() not in _TW_SKIP and len(u) >= 2:
+                        return u
+
+    except Exception:
+        pass
+
+    # ── Fallback: старый HTML-парсинг ────────────────────────────────────────
     try:
         async with make_client(
             extra_headers={
@@ -413,19 +571,13 @@ async def _twitter_get_username_by_email(email: str) -> str | None:
             },
             timeout=15.0,
         ) as c:
-            # Шаг 1: получаем форму сброса пароля
             r1 = await c.get("https://x.com/account/begin_password_reset")
-            html1 = r1.text
-
-            # Извлекаем authenticity_token
             tok_m = (
-                re.search(r'name="authenticity_token"\s+value="([^"]+)"', html1)
-                or re.search(r'"authenticity_token"\s*:\s*"([^"]+)"', html1)
+                re.search(r'name="authenticity_token"\s+value="([^"]+)"', r1.text)
+                or re.search(r'"authenticity_token"\s*:\s*"([^"]+)"', r1.text)
             )
             if not tok_m:
                 return None
-
-            # Шаг 2: отправляем email
             r2 = await c.post(
                 "https://x.com/account/begin_password_reset",
                 data={
@@ -439,38 +591,20 @@ async def _twitter_get_username_by_email(email: str) -> str | None:
                     "Referer": "https://x.com/account/begin_password_reset",
                 },
             )
-            html2 = r2.text
-
-            # Ищем @username в ответе — ТОЛЬКО надёжные паттерны.
-            # Широкие URL-паттерны (x.com/...) не используем — слишком много ложных
-            # совпадений (x.com/forms, x.com/i, x.com/login и т.д.).
-            reliable_patterns = [
+            for pat in [
                 r'"screen_name"\s*:\s*"([A-Za-z0-9_]{1,50})"',
                 r'"username"\s*:\s*"([A-Za-z0-9_]{1,50})"',
                 r'data-screen-name="([A-Za-z0-9_]{1,50})"',
-                r'href="/([A-Za-z0-9_]{1,50})/status/',  # ссылка на твит профиля
-            ]
-            # Системные пути X/Twitter — не являются usernames
-            SKIP_PATHS = {
-                "account", "login", "signup", "home", "search", "hashtag", "intent",
-                "privacy", "tos", "settings", "i", "help", "explore", "notifications",
-                "messages", "compose", "verify", "flow", "forms", "status", "oauth",
-                "widgets", "api", "about", "web", "en", "share", "redirect",
-                "download", "communities", "topics", "bookmarks", "lists", "connect",
-            }
-            for pat in reliable_patterns:
-                for m in re.finditer(pat, html2):
+                r'href="/([A-Za-z0-9_]{1,50})/status/',
+                r'(?<![/\w])@([A-Za-z0-9_]{2,50})(?![/\w])',
+            ]:
+                for m in re.finditer(pat, r2.text):
                     u = m.group(1)
-                    if u.lower() not in SKIP_PATHS and len(u) >= 2:
+                    if u.lower() not in _TW_SKIP and len(u) >= 2:
                         return u
-
-            # Паттерн @mention как последний резерв — только если окружён пробелами/тегами
-            for m in re.finditer(r'(?<![/\w])@([A-Za-z0-9_]{2,50})(?![/\w])', html2):
-                u = m.group(1)
-                if u.lower() not in SKIP_PATHS:
-                    return u
     except Exception:
         pass
+
     return None
 
 
@@ -1244,9 +1378,12 @@ def _email_line(platform: str, res: dict) -> str:
         # Если чекер вернул прямую ссылку на профиль (Twitter forgot-password flow)
         direct_url = res.get("url") or ""
         direct_name = res.get("name") or ""
+        note = res.get("note") or ""
         if direct_url:
             link_text = direct_name or direct_url
             lines.append(f"{icon} <b>{pname}:</b> ✅ {make_link(link_text, direct_url)}")
+        elif note:
+            lines.append(f"{icon} <b>{pname}:</b> ✅ Зарегистрирован <i>({h(note)})</i>")
         else:
             lines.append(f"{icon} <b>{pname}:</b> ✅ Зарегистрирован")
         # Показываем аккаунты если есть (Facebook identify-flow)
@@ -1286,7 +1423,6 @@ def _user_line(platform: str, res: dict, username: str) -> str:
     name = h(platform)
     url = res.get("url") or profile_url(platform, username)
     link = make_link("профиль", url) if url else ""
-    guess = make_link("открыть профиль", url) if url else ""
 
     if res.get("found") == "manual":
         return f"{icon} <b>{name}:</b> 🔗 {make_link('проверь вручную', url)}"
@@ -1298,14 +1434,10 @@ def _user_line(platform: str, res: dict, username: str) -> str:
     if res.get("found") == "rate_limit":
         return f"{icon} <b>{name}:</b> ⏳ Rate limit — {link}"
     if res.get("found") is False:
-        # Не подтвердили автоматически — даём ссылку-догадку, чтобы проверить вручную
-        suffix = f" — {guess}" if guess else ""
-        return f"{icon} <b>{name}:</b> ❌ Не найден{suffix}"
+        return f"{icon} <b>{name}:</b> ❌ Не найден"
     if res.get("error"):
-        suffix = f" — {guess}" if guess else ""
-        return f"{icon} <b>{name}:</b> 🔴 <code>{h(res['error'])}</code>{suffix}"
-    suffix = f" — {guess}" if guess else ""
-    return f"{icon} <b>{name}:</b> ❓{suffix}"
+        return f"{icon} <b>{name}:</b> 🔴 <code>{h(res['error'])}</code>"
+    return f"{icon} <b>{name}:</b> ❓"
 
 
 def fmt_username(username: str, results: dict, elapsed: float) -> str:
@@ -1493,14 +1625,20 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         lines.append(f"🌐 <b>PROXY_URL:</b> <code>{h(masked)}</code>")
         if _PROXY_NORMALIZED != PROXY_URL:
             lines.append("   <i>✏️ URL нормализован (спецсимволы в пароле закодированы)</i>")
+        # Предупреждение если socksio не установлен
+        if not _SOCKS_AVAILABLE and (_PROXY_NORMALIZED.startswith("socks")):
+            lines.append("   ⚠️ <b>ВНИМАНИЕ:</b> socks-прокси задан, но <code>socksio</code> не установлен!")
+            lines.append("   Выполни: <code>pip install httpx[socks]</code>")
     else:
         lines.append("🌐 <b>PROXY_URL:</b> ❌ не задан")
         lines.append("   <i>Без прокси Facebook/Instagram/LinkedIn/CryptoRank блокируют датацентровые IP</i>")
         lines.append("")
-        lines.append("<b>Как добавить:</b>")
-        lines.append("GitHub → Settings → Secrets → Actions → New secret")
-        lines.append("<code>Name:  PROXY_URL</code>")
-        lines.append("<code>Value: socks5://ЛОГИН:ПАРОЛЬ@ХОСТ:ПОРТ</code>")
+        lines.append("<b>Как добавить (Replit):</b>")
+        lines.append("Tools → Secrets → + New Secret")
+        lines.append("<code>Key:   PROXY_URL</code>")
+        lines.append("<code>Value: socks5h://ЛОГИН:ПАРОЛЬ@ХОСТ:ПОРТ</code>")
+        lines.append("")
+        lines.append("<b>Также нужен пакет:</b> <code>pip install httpx[socks]</code>")
 
     # Тест подключения через прокси
     lines.append("")
@@ -1548,6 +1686,10 @@ def main() -> None:
     print("─" * 60)
     print("  OSINT Telegram Bot")
     print(f"  PROXY_URL:  {proxy_status}")
+    if PROXY_URL and not _SOCKS_AVAILABLE:
+        print("  ⚠️  socksio НЕ установлен — SOCKS-прокси не будет работать!")
+        print("      Выполни: pip install httpx[socks]")
+    print(f"  SOCKSIO:    {'✅ установлен' if _SOCKS_AVAILABLE else '❌ не установлен (pip install httpx[socks])'}")
     print(f"  CAPTCHA:    {'задан' if CAPTCHA_KEY else 'не задан'}")
     print(f"  DELAY:      {FILE_DELAY}с")
     print("─" * 60)
