@@ -358,140 +358,234 @@ async def _check_twitter_email(email: str, _unused=None) -> dict:
         return {"error": str(e)[:80]}
 
 
+def _fb_parse_accounts(html: str) -> list[dict]:
+    """
+    Парсит HTML ответа Facebook identify-flow.
+    Ищет имена аккаунтов, ссылки на профили и URL фото.
+    Возвращает список: [{"name": "...", "url": "...", "photo": "..."}]
+    """
+    from bs4 import BeautifulSoup
+    import json as _json
+
+    accounts: list[dict] = []
+
+    # Попытка 1: AJAX ответ (for (;;); + JSON с HTML внутри)
+    raw = html
+    if raw.startswith("for (;;);"):
+        raw = raw[9:]
+    try:
+        data = _json.loads(raw)
+        # Facebook кладёт HTML либо в domops, либо в payload/content
+        inner_html = ""
+        for key in ("payload", "jsmods", "domops"):
+            val = data.get(key)
+            if isinstance(val, str) and len(val) > 50:
+                inner_html = val
+                break
+            if isinstance(val, dict):
+                inner_html = str(val)
+                break
+        if inner_html:
+            html = inner_html
+    except Exception:
+        pass
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Попытка 2: найти ссылки содержащие /profile.php или facebook.com/
+    seen: set[str] = set()
+    for a in soup.find_all("a", href=True):
+        href: str = a["href"]
+        # Нормализуем относительные ссылки
+        if href.startswith("/"):
+            href = "https://www.facebook.com" + href
+
+        # Пропускаем служебные страницы
+        skip_patterns = [
+            "/login", "/r.php", "/recover", "/identify",
+            "help.facebook", "#", "javascript",
+            "/policies", "/privacy", "/terms",
+        ]
+        if any(p in href for p in skip_patterns):
+            continue
+
+        is_profile = (
+            "profile.php?id=" in href
+            or re.search(r"facebook\.com/[A-Za-z0-9_.]{3,}/?$", href)
+        )
+        if not is_profile:
+            continue
+
+        # Имя — текст внутри ссылки или ближайший текстовый узел
+        name = a.get_text(strip=True)
+        if not name:
+            # Ищем соседний текст
+            parent = a.parent
+            if parent:
+                name = parent.get_text(strip=True)
+        name = re.sub(r"\s+", " ", name).strip()[:60]
+        if not name or len(name) < 2:
+            name = "Facebook аккаунт"
+
+        # Фото — img внутри ссылки или рядом
+        photo = ""
+        img = a.find("img")
+        if not img and a.parent:
+            img = a.parent.find("img")
+        if img and img.get("src", "").startswith("http"):
+            photo = img["src"]
+
+        if href not in seen:
+            seen.add(href)
+            accounts.append({"name": name, "url": href, "photo": photo})
+
+    # Попытка 3: вытащить имена и UID из JSON-данных в <script>
+    if not accounts:
+        # Ищем паттерны вида "name":"John Doe","id":"123456"
+        name_ids = re.findall(r'"name"\s*:\s*"([^"]{2,60})"[^}]*?"id"\s*:\s*"(\d{6,})"', html)
+        for name, uid in name_ids[:5]:
+            url = f"https://www.facebook.com/profile.php?id={uid}"
+            if url not in seen:
+                seen.add(url)
+                accounts.append({"name": name, "url": url, "photo": ""})
+
+    return accounts[:5]  # Максимум 5 аккаунтов
+
+
 async def _check_facebook_email(email: str, _unused=None) -> dict:
     """
-    Facebook — registration check + forgot-password fallback.
-    Использует make_client() → случайный UA + прокси.
+    Facebook — identify flow (forgot-password).
+    Извлекает имя аккаунта, ссылку на профиль и фото.
 
-    Шаг 1: GET /r.php (регистрация) → LSD + jazoest
-    Шаг 2: POST /api/v1/web/accounts/web_create_ajax/attempt/ → "email_is_taken"?
-    Шаг 3: fallback → forgot-password /ajax/login/help/identify.php
+    Шаг 1: GET /login/identify/?ctx=recover → LSD + jazoest токены
+    Шаг 2: POST email на identify → парсим аккаунты из HTML-ответа
+    Шаг 3: Fallback — registration check через /r.php
 
-    Если прокси не задан и IP сервера заблокирован Facebook — вернёт ошибку.
-    Решение: задать PROXY_URL в окружении.
+    Возвращает:
+      {"found": True, "accounts": [{"name": "...", "url": "...", "photo": "..."}]}
+      {"found": False}
+      {"error": "..."}
     """
     try:
         await jitter(0.3, 0.8)
         async with make_client(
             extra_headers={"Upgrade-Insecure-Requests": "1"},
-            timeout=20.0,
-            http2=False,  # Facebook стабильнее на HTTP/1.1
+            timeout=25.0,
+            http2=False,
         ) as c:
-            # Шаг 1: страница регистрации
+
+            # ── Шаг 1: Identify page — основной путь ──────────────────
             r1 = await c.get(
-                "https://www.facebook.com/r.php",
+                "https://www.facebook.com/login/identify/",
+                params={"ctx": "recover"},
                 headers={"Referer": "https://www.google.com/"},
             )
-            html = r1.text
+            html1 = r1.text
 
-            # Достаём LSD из нескольких возможных мест
-            lsd_m = (
-                re.search(r'\["LSD",\[\],\{"token":"([^"]+)"\}', html)
-                or re.search(r'name="lsd"\s+value="([^"]+)"', html)
-                or re.search(r'"lsd"\s*:\s*"([^"]+)"', html)
-                or re.search(r'"token"\s*:\s*"([A-Za-z0-9_\-]{6,})"', html)
-            )
-            # Достаём jazoest
-            j_m = (
-                re.search(r'name="jazoest"\s+value="(\d+)"', html)
-                or re.search(r'jazoest=(\d+)', html)
-                or re.search(r'"jazoest"\s*:\s*"?(\d+)"?', html)
-            )
-
-            if not lsd_m:
-                # Пробуем через mobile Facebook — другая структура HTML
-                r1m = await c.get(
-                    "https://m.facebook.com/r.php",
-                    headers={"Referer": "https://www.google.com/"},
-                )
-                html = r1m.text
+            def _extract_tokens(html: str) -> tuple[str, str]:
                 lsd_m = (
                     re.search(r'\["LSD",\[\],\{"token":"([^"]+)"\}', html)
                     or re.search(r'name="lsd"\s+value="([^"]+)"', html)
                     or re.search(r'"lsd"\s*:\s*"([^"]+)"', html)
+                    or re.search(r'"token"\s*:\s*"([A-Za-z0-9_\-]{6,})"', html)
                 )
                 j_m = (
                     re.search(r'name="jazoest"\s+value="(\d+)"', html)
                     or re.search(r'jazoest=(\d+)', html)
                 )
+                return (lsd_m.group(1) if lsd_m else ""), (j_m.group(1) if j_m else "2488")
 
-            if not lsd_m:
-                return {"error": "FB: нет LSD токена — IP сервера заблокирован Facebook"}
+            lsd, jazoest = _extract_tokens(html1)
 
-            lsd = lsd_m.group(1)
-            jazoest = j_m.group(1) if j_m else "2488"
+            # Если не нашли токены — пробуем m.facebook.com
+            if not lsd:
+                r1m = await c.get(
+                    "https://m.facebook.com/login/identify/",
+                    params={"ctx": "recover"},
+                    headers={"Referer": "https://www.google.com/"},
+                )
+                lsd, jazoest = _extract_tokens(r1m.text)
+                if not lsd:
+                    return {"error": "FB: нет LSD токена — IP сервера заблокирован Facebook"}
 
-            # Шаг 2: попытка регистрации — Facebook сразу скажет "email занят"
+            # ── Шаг 2: Отправляем email в identify ────────────────────
             r2 = await c.post(
-                "https://www.facebook.com/api/v1/web/accounts/web_create_ajax/attempt/",
+                "https://www.facebook.com/login/identify/",
+                params={"ctx": "recover"},
                 data={
-                    "jazoest": jazoest,
                     "lsd": lsd,
+                    "jazoest": jazoest,
                     "email": email,
-                    "username": rand_str(14),
-                    "first_name": "Test",
-                    "opt_into_one_tap": "false",
+                    "did_submit": "1",
+                    "__a": "1",
+                    "__req": "2",
+                    "__user": "0",
                 },
                 headers={
                     "Content-Type": "application/x-www-form-urlencoded",
                     "Origin": "https://www.facebook.com",
-                    "Referer": "https://www.facebook.com/r.php",
+                    "Referer": "https://www.facebook.com/login/identify/?ctx=recover",
                     "x-fb-lsd": lsd,
+                    "x-requested-with": "XMLHttpRequest",
                     "sec-fetch-site": "same-origin",
                     "sec-fetch-mode": "cors",
                     "sec-fetch-dest": "empty",
                 },
             )
-            body = r2.text
+            body2 = r2.text
 
-            # Точные сигналы из JSON-ответа
-            if "email_is_taken" in body or "EMAIL_IS_TAKEN" in body:
-                return {"found": True}
-            if "email_sharing_limit" in body:
-                return {"found": True}  # Лимит = email уже есть
+            # Явный сигнал — аккаунт не найден
+            not_found_signals = [
+                "No search results", "no_results", "no accounts found",
+                "couldn't find", "not found", "ACCOUNT_NOT_FOUND",
+            ]
+            if any(s.lower() in body2.lower() for s in not_found_signals):
+                return {"found": False}
 
-            # Fallback: forgot-password через identify
-            # Переиспользуем ту же сессию (те же куки)
-            r3 = await c.get("https://www.facebook.com", params={"_rdr": ""})
-            html3 = r3.text
-            lsd2_m = (
-                re.search(r'\["LSD",\[\],\{"token":"([^"]+)"\}', html3)
-                or re.search(r'"lsd"\s*:\s*"([^"]+)"', html3)
+            # Явный сигнал — аккаунт найден
+            found_signals = [
+                "These accounts matched", "account matched",
+                "redirectPageTo", "checkpointLoginHelp",
+                "profile.php", "facebook.com/",
+            ]
+            if any(s in body2 for s in found_signals):
+                accounts = _fb_parse_accounts(body2)
+                return {"found": True, "accounts": accounts}
+
+            # ── Шаг 3: Fallback — registration check ──────────────────
+            r3 = await c.get(
+                "https://www.facebook.com/r.php",
+                headers={"Referer": "https://www.google.com/"},
             )
-            j2_m = re.search(r'jazoest=(\d+)', html3) or re.search(r'name="jazoest"\s+value="(\d+)"', html3)
-
-            if lsd2_m and j2_m:
-                lsd2 = lsd2_m.group(1)
+            lsd3, jazoest3 = _extract_tokens(r3.text)
+            if lsd3:
                 r4 = await c.post(
-                    "https://www.facebook.com/ajax/login/help/identify.php",
-                    params={"ctx": "recover"},
+                    "https://www.facebook.com/api/v1/web/accounts/web_create_ajax/attempt/",
                     data={
-                        "jazoest": j2_m.group(1),
-                        "lsd": lsd2,
+                        "jazoest": jazoest3,
+                        "lsd": lsd3,
                         "email": email,
-                        "did_submit": "1",
-                        "__user": "0",
-                        "__a": "1",
-                        "__req": "7",
+                        "username": rand_str(14),
+                        "first_name": "Test",
+                        "opt_into_one_tap": "false",
                     },
                     headers={
                         "Content-Type": "application/x-www-form-urlencoded",
                         "Origin": "https://www.facebook.com",
-                        "Referer": "https://www.facebook.com/login/identify/?ctx=recover",
-                        "x-fb-lsd": lsd2,
+                        "Referer": "https://www.facebook.com/r.php",
+                        "x-fb-lsd": lsd3,
                         "sec-fetch-site": "same-origin",
                         "sec-fetch-mode": "cors",
+                        "sec-fetch-dest": "empty",
                     },
                 )
-                b4 = r4.text
-                if "These accounts matched" in b4 or "redirectPageTo" in b4:
-                    return {"found": True}
-                if "No search results" in b4 or "no_results" in b4:
+                body4 = r4.text
+                if "email_is_taken" in body4 or "EMAIL_IS_TAKEN" in body4:
+                    return {"found": True, "accounts": []}
+                if "email_sharing_limit" in body4:
+                    return {"found": True, "accounts": []}
+                if '"status":"ok"' in body4 or '"errors":{}' in body4:
                     return {"found": False}
-
-            # Если оба метода не дали чёткого ответа
-            if '"status":"ok"' in body or '"errors":{}' in body:
-                return {"found": False}  # Регистрация прошла бы — email свободен
 
             return {"error": "FB: неопределённый ответ (возможно IP блокируется)"}
 
@@ -996,16 +1090,31 @@ async def scan_username(username: str) -> tuple[dict, float]:
 
 def _email_line(platform: str, res: dict) -> str:
     icon = ICONS.get(platform, "🔎")
-    name = h(platform)
+    pname = h(platform)
     if res.get("found") is True:
-        return f"{icon} <b>{name}:</b> ✅ Зарегистрирован"
+        lines = [f"{icon} <b>{pname}:</b> ✅ Зарегистрирован"]
+        # Показываем аккаунты если есть (Facebook identify-flow)
+        for acc in res.get("accounts") or []:
+            acc_name = h(acc.get("name") or "")
+            acc_url  = acc.get("url") or ""
+            acc_photo = acc.get("photo") or ""
+            parts = []
+            if acc_name:
+                parts.append(f"<b>{acc_name}</b>")
+            if acc_url:
+                parts.append(make_link("→ профиль", acc_url))
+            if acc_photo:
+                parts.append(make_link("🖼 фото", acc_photo))
+            if parts:
+                lines.append("   " + "  ".join(parts))
+        return "\n".join(lines)
     if res.get("found") == "rate_limit":
-        return f"{icon} <b>{name}:</b> ⏳ Rate limit — повтори позже"
+        return f"{icon} <b>{pname}:</b> ⏳ Rate limit — повтори позже"
     if res.get("found") is False:
-        return f"{icon} <b>{name}:</b> ❌ Не зарегистрирован"
+        return f"{icon} <b>{pname}:</b> ❌ Не зарегистрирован"
     if res.get("error"):
-        return f"{icon} <b>{name}:</b> 🔴 <code>{h(res['error'])}</code>"
-    return f"{icon} <b>{name}:</b> ❓"
+        return f"{icon} <b>{pname}:</b> 🔴 <code>{h(res['error'])}</code>"
+    return f"{icon} <b>{pname}:</b> ❓"
 
 
 def fmt_email(email: str, results: dict, elapsed: float) -> str:
