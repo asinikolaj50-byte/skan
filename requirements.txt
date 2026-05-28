@@ -1,4 +1,4 @@
-httpx[http2,socks]>=0.27.0
+curl_cffi>=0.7.0
 trio>=0.22.0
 tqdm>=4.65.0
 colorama>=0.4.6
